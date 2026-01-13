@@ -1,0 +1,27 @@
+plot_name: 'G_MF'
+palette:  {'M': 'blue','F': 'purple'}
+categories:
+  M: 
+    labels: [GM]
+    articles: [des]
+    codes: [0]
+    score_label: 1
+    encoding: -1
+  F: 
+    labels: [GF]
+    articles: [der]
+    codes: [1]
+    score_label: 0
+    encoding: 1
+combinations: ['GM', 'GF']
+articles: ['der', 'des']
+GM: 
+  mask: '[DES_ARTICLE]'
+  inverse: 'der'
+  code: 1
+  encoding: -1
+GF: 
+  mask: '[DER_ARTICLE]'
+  inverse: 'des'
+  code: 1
+  encoding: 1

@@ -59,13 +59,13 @@ for base_model in models:
     for version_suffix, version in versions.items():
         version_stats = decoder_metrics[version.lower()]
         lr = version_stats['lr']
-        gender_factor = version_stats['gender_factor']
-        row = [f'\, + {gradiend_map[version_suffix]}', f'{gender_factor:.1f}', f'{lr:.0e}']
-        if lr == 0 and gender_factor == 0:
+        feature_factor = version_stats['feature_factor']
+        row = [f'\, + {gradiend_map[version_suffix]}', f'{feature_factor:.1f}', f'{lr:.0e}']
+        if lr == 0 and feature_factor == 0:
             version_metrics = base_metrics
             print(f'The base model {base_model} is the best model for {version} and {base_model}')
         else:
-            version_metrics = decoder_metrics[(gender_factor, lr)]
+            version_metrics = decoder_metrics[(feature_factor, lr)]
 
         for metric_name, metric_getter in metrics.items():
             row.append(f'{metric_getter(version_metrics):.3f}')

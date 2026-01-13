@@ -569,7 +569,7 @@ def evaluate_model(model, tokenizer, verbose=True, df_name=None, thorough=True, 
 
     return result
 
-def get_evaluation_file(path, gender_factors, lrs, thorough=True, top_k=None, part=None, top_k_part=None):
+def get_evaluation_file(path, feature_factors, lrs, thorough=True, top_k=None, part=None, top_k_part=None):
     top_k = f'_top_k_{top_k}' if top_k is not None else ''
     iter_stats = lambda iterable: f'{min(iterable)}_{max(iterable)}_{len(iterable)}{top_k}'
     not_thorough = '_not_thorough' if not thorough else ''
@@ -579,7 +579,7 @@ def get_evaluation_file(path, gender_factors, lrs, thorough=True, top_k=None, pa
     if top_k_part != 'decoder':
         top_k_part = f'_top_k_{top_k_part}'
 
-    return f'{path}_{thorough}{top_k}{part}{top_k_part}_evaluation.json', f'{path}_evaluation_{iter_stats(gender_factors)}_{iter_stats(lrs)}{not_thorough}{top_k}{part}{top_k_part}.json'
+    return f'{path}_{thorough}{top_k}{part}{top_k_part}_evaluation.json', f'{path}_evaluation_{iter_stats(feature_factors)}_{iter_stats(lrs)}{not_thorough}{top_k}{part}{top_k_part}.json'
 
 def convert_results_to_dict(list_results):
     dict_result = {}
@@ -588,16 +588,16 @@ def convert_results_to_dict(list_results):
         if isinstance(id, str):
             key = id
         else:
-            key = (id['gender_factor'], id['lr'])
+            key = (id['feature_factor'], id['lr'])
 
         dict_result[key] = entry
     return dict_result
 
 def convert_results_to_list(dict_results):
-    return [{**dict_result, 'id': (key if isinstance(key, str) else {'gender_factor': key[0], 'lr': key[1]})} for key, dict_result in dict_results.items()]
+    return [{**dict_result, 'id': (key if isinstance(key, str) else {'feature_factor': key[0], 'lr': key[1]})} for key, dict_result in dict_results.items()]
 
 
-def evaluate_bert_with_ae(path_or_model, gender_factors=None, lrs=None, thorough=True, top_k=None, accuracy_function=None, part='decoder', top_k_part='decoder'):
+def evaluate_bert_with_ae(path_or_model, feature_factors=None, lrs=None, thorough=True, top_k=None, accuracy_function=None, part='decoder', top_k_part='decoder'):
     accuracy_function = accuracy_function or default_accuracy_function
     metric_keys = ['bpi', 'fpi', 'mpi']
 
@@ -617,15 +617,15 @@ def evaluate_bert_with_ae(path_or_model, gender_factors=None, lrs=None, thorough
         for key in metric_keys:
             arg_max = max(raw_results, key=lambda x: raw_results[x][key])
             if arg_max == 'base':
-                gender_factor = 0
+                feature_factor = 0
                 lr = 0
             else:
-                gender_factor = arg_max[0]
+                feature_factor = arg_max[0]
                 lr = arg_max[1]
             relevant_results[key] = {
                 'value': raw_results[arg_max][key],
                 'id': arg_max,
-                'gender_factor': gender_factor,
+                'feature_factor': feature_factor,
                 'lr': lr,
             }
         return relevant_results
@@ -640,11 +640,11 @@ def evaluate_bert_with_ae(path_or_model, gender_factors=None, lrs=None, thorough
     base_model = bert_with_ae.base_model
     tokenizer = bert_with_ae.tokenizer
     model_id = os.path.basename(path) if path.startswith('results/models') else path
-    base_file, file = get_evaluation_file(f'results/cache/decoder/{model_id}', gender_factors, lrs, thorough=thorough, top_k=top_k, part=part, top_k_part=top_k_part)
+    base_file, file = get_evaluation_file(f'results/cache/decoder/{model_id}', feature_factors, lrs, thorough=thorough, top_k=top_k, part=part, top_k_part=top_k_part)
     os.makedirs(os.path.dirname(base_file), exist_ok=True)
     os.makedirs(os.path.dirname(file), exist_ok=True)
 
-    pairs = {(gender_factor, lr) for gender_factor in gender_factors for lr in lrs}
+    pairs = {(feature_factor, lr) for feature_factor in feature_factors for lr in lrs}
     expected_results = len(pairs) + 1 + 3 # 1 because of base, 3 because of bpi, mpi, fpi
 
     try:
@@ -706,20 +706,20 @@ def evaluate_bert_with_ae(path_or_model, gender_factors=None, lrs=None, thorough
         relevant_results['base'] = base_results
 
 
-    for gender_factor, lr in tqdm(pairs, desc=f"Evaluate GRADIEND {path_or_model}"):
-        id = {'gender_factor': gender_factor, 'lr': lr}
-        id_key = (gender_factor, lr)
+    for feature_factor, lr in tqdm(pairs, desc=f"Evaluate GRADIEND {path_or_model}"):
+        id = {'feature_factor': feature_factor, 'lr': lr}
+        id_key = (feature_factor, lr)
         if id_key in relevant_results:
             print(f"Skipping {id} as it is already evaluated")
             continue
 
-        enhanced_bert = bert_with_ae.modify_model(lr=lr, gender_factor=gender_factor, top_k=top_k, part=part, top_k_part=top_k_part)
+        enhanced_bert = bert_with_ae.modify_model(lr=lr, feature_factor=feature_factor, top_k=top_k, part=part, top_k_part=top_k_part)
         if top_k is None:
-            df_name = f'results/cache/models/{bert_with_ae.name}_lr_{lr}_gf_{gender_factor}.csv'
+            df_name = f'results/cache/models/{bert_with_ae.name}_lr_{lr}_gf_{feature_factor}.csv'
         else:
-            df_name = f'results/cache/models/{bert_with_ae.name}/{top_k}/lr_{lr}_gf_{gender_factor}.csv'
+            df_name = f'results/cache/models/{bert_with_ae.name}/{top_k}/lr_{lr}_gf_{feature_factor}.csv'
 
-        enhanced_bert_results = evaluate_model(enhanced_bert, tokenizer, df_name=df_name, thorough=thorough, cache_folder=f'{gender_factor}_{lr}_v2') # force=True?
+        enhanced_bert_results = evaluate_model(enhanced_bert, tokenizer, df_name=df_name, thorough=thorough, cache_folder=f'{feature_factor}_{lr}_v2') # force=True?
         all_results[id_key] = enhanced_bert_results
         relevant_results[id_key] = enhanced_bert_results
 
@@ -738,7 +738,7 @@ def evaluate_bert_with_ae(path_or_model, gender_factors=None, lrs=None, thorough
 
 def plot_bert_with_ae_results(data,
                               model_name,
-                              gender_factors=None,
+                              feature_factors=None,
                               lrs=None,
                               metrics=None,
                               friend=True,
@@ -767,9 +767,9 @@ def plot_bert_with_ae_results(data,
         print(json.dumps(data, indent=2))
         raise ValueError('No baseline found in data!')
 
-    if gender_factors is None or lrs is None:
-        if gender_factors is None:
-            gender_factors = []
+    if feature_factors is None or lrs is None:
+        if feature_factors is None:
+            feature_factors = []
         if lrs is None:
             lrs = []
 
@@ -778,16 +778,16 @@ def plot_bert_with_ae_results(data,
             if id == 'base':
                 continue
 
-            gender_factor = entry['id']['gender_factor']
+            feature_factor = entry['id']['feature_factor']
             lr = entry['id']['lr']
-            if gender_factor not in gender_factors:
-                gender_factors.append(gender_factor)
+            if feature_factor not in feature_factors:
+                feature_factors.append(feature_factor)
 
             if lr not in lrs:
                 lrs.append(lr)
 
         # sort the lists
-        gender_factors = list(sorted(gender_factors))
+        feature_factors = list(sorted(feature_factors))
         lrs = list(sorted(lrs))
 
 
@@ -864,14 +864,14 @@ def plot_bert_with_ae_results(data,
 
     for metric in metrics:
         df = pd.DataFrame([{
-            'gender_factor': e['id']['gender_factor'],
+            'feature_factor': e['id']['feature_factor'],
             'lr': e['id']['lr'],
             'value': get_metric(e, metric)
         } for e in evaluations if isinstance(e, dict) and isinstance(e['id'], dict)])
         metric_dfs[metric] = df
 
-        # rename column gender_factor to "Gender Factor"
-        df[gf_name] = df['gender_factor']
+        # rename column feature_factor to "Gender Factor"
+        df[gf_name] = df['feature_factor']
         df[lr_name] = df['lr']
 
         if gf_x_axis:
@@ -945,12 +945,12 @@ def plot_bert_with_ae_results(data,
     fig.suptitle(model_name, y=1, fontsize=25)
     plt.tight_layout(rect=[0, 0, 0.98, 1])
 
-    def get_evaluation_file(path, gender_factors, lrs, thorough=True):
+    def get_evaluation_file(path, feature_factors, lrs, thorough=True):
         iter_stats = lambda iterable: f'{min(iterable)}_{max(iterable)}_{len(iterable)}'
         not_thorough = '_not_thorough' if not thorough else ''
-        return f'results/models/{model_name}_evaluation{not_thorough}.json', f'results/models/{model_name}_evaluation_{iter_stats(gender_factors)}_{iter_stats(lrs)}{not_thorough}.json'
+        return f'results/models/{model_name}_evaluation{not_thorough}.json', f'results/models/{model_name}_evaluation_{iter_stats(feature_factors)}_{iter_stats(lrs)}{not_thorough}.json'
 
-    _, image_file = get_evaluation_file(f'results/img/{model_name}', gender_factors, lrs, thorough=thorough)
+    _, image_file = get_evaluation_file(f'results/img/{model_name}', feature_factors, lrs, thorough=thorough)
     base_image_file = image_file.replace('.json', f'{"_small" if small else ""}{"_square" if square else ""}.pdf')
     plt.savefig(base_image_file, bbox_inches='tight')
     plt.show()
@@ -1062,27 +1062,27 @@ def plot_bert_with_ae_results(data,
     return data
 
 # currently not used function!
-def top_neuron_evaluation(model, bin_size=100, lr=None, gender_factor=None, key='bpi', thorough=True, plot=True):
-    if lr is None or gender_factor is None:
+def top_neuron_evaluation(model, bin_size=100, lr=None, feature_factor=None, key='bpi', thorough=True, plot=True):
+    if lr is None or feature_factor is None:
         print(f'Determining best best choice for lr and gender factor based on default_evaluation and key {key}')
         evaluation = default_evaluation(model, large=True, plot=False)
         best = evaluation[key]
         print(f'Best choice for {key} is {best}')
         if lr is None:
             lr = best['lr']
-        if gender_factor is None:
-            gender_factor = best['gender_factor']
+        if feature_factor is None:
+            feature_factor = best['feature_factor']
 
 
     bert_with_ae = ModelWithGradiend.from_pretrained(model)
     base_model = bert_with_ae.base_model
     tokenizer = bert_with_ae.tokenizer
 
-    def get_evaluation_file(path, gender_factor, lr, bin_size):
+    def get_evaluation_file(path, feature_factor, lr, bin_size):
         not_thorough = '_not_thorough' if not thorough else ''
-        return f'{path}_top_k_evaluation_gf_{gender_factor}_lr_{lr:.1e}{not_thorough}.json', f'{path}_top_k_evaluation_bs_{bin_size}_gf_{gender_factor}_lr_{lr:.1e}{not_thorough}.json'
+        return f'{path}_top_k_evaluation_gf_{feature_factor}_lr_{lr:.1e}{not_thorough}.json', f'{path}_top_k_evaluation_bs_{bin_size}_gf_{feature_factor}_lr_{lr:.1e}{not_thorough}.json'
 
-    base_file, file = get_evaluation_file(model + f'/../cache/decoder/' + os.path.basename(model), gender_factor, lr, bin_size)
+    base_file, file = get_evaluation_file(model + f'/../cache/decoder/' + os.path.basename(model), feature_factor, lr, bin_size)
     os.makedirs(os.path.dirname(base_file), exist_ok=True)
     os.makedirs(os.path.dirname(file), exist_ok=True)
 
@@ -1150,7 +1150,7 @@ def top_neuron_evaluation(model, bin_size=100, lr=None, gender_factor=None, key=
         raw_enhanced_bert_results = default_evaluation(model, plot=False, large=False, top_k=border)
         enhanced_bert_results = {key: raw_enhanced_bert_results[key]['value'] for key in keys}
         print(f"Results for {id}: {enhanced_bert_results}")
-        print('Genderfactor', raw_enhanced_bert_results[key]['gender_factor'])
+        print('Genderfactor', raw_enhanced_bert_results[key]['feature_factor'])
         print('Learning Rate', raw_enhanced_bert_results[key]['lr'])
 
         all_results[id] = enhanced_bert_results
@@ -1177,23 +1177,23 @@ def top_neuron_evaluation(model, bin_size=100, lr=None, gender_factor=None, key=
 
     return relevant_results
 
-default_evaluation_gender_factors = [-10, -2] + [-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0] + [2, 10]
+default_evaluation_feature_factors = [-10, -2] + [-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0] + [2, 10]
 default_evaluation_lrs = [-0.5, -1e-1, -5e-2, -1e-2, -5e-3, -1e-3, -5e-4, -1e-4,  1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 0.5] # -5e-5, -1e-5, 1e-5, 5e-5,
 def default_evaluation(model, large=True, plot=True, top_k=None, accuracy_function=None, part='decoder', top_k_part='decoder', **kwargs):
     if large:
-        gender_factors = default_evaluation_gender_factors
+        feature_factors = default_evaluation_feature_factors
         lrs = default_evaluation_lrs
         #lrs = [-5e-2, -1e-2, -5e-3, -1e-3, -5e-4, -1e-4, -5e-5, -1e-5, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2]
     else:
-        gender_factors = [-1, 0, 1]
+        feature_factors = [-1, 0, 1]
         lrs = [1e-2, 1e-3, 1e-4, 1e-5]
     
     #TODO this needs to change but what does it need to return for the plot to work
-    data = evaluate_bert_with_ae(model, gender_factors, lrs, thorough=large, top_k=top_k, accuracy_function=accuracy_function, part=part, top_k_part=top_k_part)
+    data = evaluate_bert_with_ae(model, feature_factors, lrs, thorough=large, top_k=top_k, accuracy_function=accuracy_function, part=part, top_k_part=top_k_part)
 
     if plot:
         model = os.path.basename(model.removesuffix('gradiend'))
-        plot_bert_with_ae_results(data, model, gender_factors=gender_factors, lrs=lrs, thorough=large, **kwargs)
+        plot_bert_with_ae_results(data, model, feature_factors=feature_factors, lrs=lrs, thorough=large, **kwargs)
 
     return data
 
@@ -1210,7 +1210,7 @@ def test_aggregation_functions(model):
     }
 
     model_id = os.path.basename(model) if model.startswith('results/models') else model
-    base_file, _ = get_evaluation_file(f'results/cache/decoder/{model_id}', default_evaluation_gender_factors, default_evaluation_lrs)
+    base_file, _ = get_evaluation_file(f'results/cache/decoder/{model_id}', default_evaluation_feature_factors, default_evaluation_lrs)
 
     def bpi_fpi_mpi(stats, accuracy_conversion_function):
         acc = stats['mlm']['accuracy']

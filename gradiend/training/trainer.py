@@ -14,14 +14,12 @@ from torch.utils.data import DataLoader
 import torch
 
 import logging
-from gradiend.training.PCGRAD_tf import PCGrad
 from gradiend.model import ModelWithGradiend
-from gradiend.training.dataset import create_training_dataset, create_eval_dataset
 
 import datetime
 import os
 
-from gradiend.training.de_training_dataset import FlattenedConcatDataset, PairedLabelBatchSampler, SingleLabelBatchSampler, create_de_eval_dataset, create_de_training_dataset, flatten_dict_list_collate
+from gradiend.training.de_training_dataset import create_de_training_dataset, create_de_eval_dataset_no_cache, OversampledSingleLabelBatchSampler
 from gradiend.util import hash_it
 
 log = logging.getLogger(__name__)
@@ -33,7 +31,7 @@ def get_log_dir(base_dir="logs", output=''):
     log_dir = os.path.join(base_dir, output + f'_{current_time}')
     return log_dir
 
-def invert(category_to_invert, category_means):
+def invert(category_to_invert, other_category, category_means):
     """
     Determine whether to invert encoding based on category means.
 
@@ -46,7 +44,6 @@ def invert(category_to_invert, category_means):
     """
     mean_to_invert = category_means[category_to_invert]
 
-    other_category = next(cat for cat in category_means if cat != category_to_invert)
     mean_other = category_means[other_category]
 
     return mean_to_invert < -0.1 and mean_other > 0.1
@@ -107,7 +104,7 @@ lr (float, default=1e-5): Learning rate.
 weight_decay (float, default=1e-2): Weight decay for optimizer.
 do_eval (bool, default=True): Enables evaluation during training.
 keep_only_best (bool, default=True): Retains only the best-performing model.
-eval_max_size (int, optional): Maximum size of evaluation dataset.
+eval_max_size (int, optional): Maximum size of evaluation datasets.
 eval_batch_size (int, default=32): Batch size for evaluation.
 eps (float, default=1e-8): Epsilon for numerical stability in optimization.
 normalized (bool, default=True): Normalizes encoded values if True.
@@ -155,6 +152,7 @@ def train(model_with_gradiend,
     print('Batch size:', batch_size)
     print('Learning rate:', lr)
     print('Source', source)
+    print('Dtype:', torch_dtype)
 
     log.info(f"Training GRADIEND")
 
@@ -165,7 +163,7 @@ def train(model_with_gradiend,
     tokenizer = model_with_gradiend.tokenizer
     is_generative = model_with_gradiend.is_generative
 
-    # Create a dataset and dataloader for BERT inputs
+    # Create a datasets and dataloader for BERT inputs
 
     if batch_size_data is True:
         batch_size_data = batch_size
@@ -178,93 +176,114 @@ def train(model_with_gradiend,
 
 
     dataset = torch.utils.data.ConcatDataset(train_datasets)  
-    dataloader = DataLoader(dataset, batch_sampler=SingleLabelBatchSampler(dataset, batch_size=batch_size))
+    dataloader = DataLoader(dataset, batch_sampler=OversampledSingleLabelBatchSampler(dataset, batch_size=batch_size))
+    #dataloader = DataLoader(dataset, batch_sampler=SingleLabelBatchSampler(dataset, batch_size=batch_size))
 
     
     if do_eval:
-        eval_data = create_de_eval_dataset(
-            model_with_gradiend, config=config, split='val', source=source, max_size=eval_max_size, is_generative=is_generative, multi_task=multi_task)
+        eval_data = create_de_eval_dataset_no_cache(
+            model_with_gradiend, config=config, split='val', source=source, eval_max_size=eval_max_size, is_generative=is_generative, multi_task=multi_task)
 
         def _evaluate(data):
-            with torch.no_grad():
-                start = time.time()
-                # even if other source is chosen, the correct gradients are loaded into eval_data
-                gradients = data['gradients']
-                labels = data['labels']
+            start = time.time()
 
-                device = model_with_gradiend.gradiend.device_encoder
-                encoded = []
+            device = model_with_gradiend.gradiend.device_encoder
+            encoded = []
+            if isinstance(data, dict):
+                with torch.no_grad():
+                    # even if other source is chosen, the correct gradients are loaded into eval_data
+                    gradients = data['gradients']
+                    labels = data['labels'].values()
+                    encodings = data['encodings']
+                    grads = list(gradients.values())
 
-                grads = list(gradients.values())
+                    if eval_batch_size > 1:
+                        for i in range(0, len(grads), eval_batch_size):
+                            batch = grads[i:min(i + eval_batch_size, len(grads))]
+                            batch_on_device = [g.to(device, dtype=torch_dtype) for g in batch]
 
-                if eval_batch_size > 1:
-                    for i in range(0, len(grads), eval_batch_size):
-                        batch = grads[i:min(i + eval_batch_size, len(grads))]
-                        batch_on_device = [g.to(device, dtype=torch_dtype) for g in batch]
-                        
-                        encoded_values = model_with_gradiend.gradiend.encoder(torch.stack(batch_on_device))
+                            encoded_values = model_with_gradiend.gradiend.encoder(torch.stack(batch_on_device))
 
-                        encoded.extend(encoded_values.detach().cpu().numpy().tolist())
+                            encoded.extend(encoded_values.detach().to(torch.float32).cpu().numpy().tolist())
 
-                        # free memory on device
-                        del batch_on_device
-                        torch.cuda.empty_cache()  # if using GPU, it helps clear memory
-                else:
-                    for grads in gradients.values():
-                       
-                        encoded_value = model_with_gradiend.gradiend.encoder(grads.to(device, dtype=torch_dtype))
-
-                        encoded.append(encoded_value.detach().cpu().numpy().tolist())
-                
-            
-                #TODO move with config
-                score_labels = {k: 1 if v in [0, 1, 2, 3] else 0 if v in [4,5,6,7] else 2 for k, v in labels.items()}
-
-                if num_dims > 1:
-                    if ensemble: 
-                        encoded = np.array(encoded).mean(axis=1) 
+                            # free memory on device
+                            del batch_on_device
+                            torch.cuda.empty_cache()  # if using GPU, it helps clear memory
                     else:
-                        encoded = [np.mean(e)[0] for e in encoded]
+                        for grads in gradients.values():
+                            encoded_value = model_with_gradiend.gradiend.encoder(grads.to(device, dtype=torch_dtype))
+                            encoded.append(encoded_value.detach().to(torch.float32).cpu().numpy().tolist())
+            else:
+                if eval_batch_size > 1:
+                    print(f"WARNING: eval batch size > 1 (is {eval_batch_size}) currently not supported ")
+                labels = []
+                encodings = {}
+                for entry in data:
+                    grads = entry['grad']
+                    labels.append(entry['label'])
+                    encodings[entry['text']] = entry['encoding']
+                    with torch.no_grad():
+                        encoded_value = model_with_gradiend.gradiend.encoder(grads.to(device, dtype=torch_dtype))
+                        encoded.append(encoded_value.detach().to(torch.float32).cpu().numpy().tolist())
+           
+            #TODO move with config
+            #score_labels = {k: 1 if v in [0, 1, 2, 3] else 0 if v in [4,5,6,7] else 2 for k, v in labels.items()}
+            score_labels = encodings.values()
+            if num_dims > 1:
+                if ensemble:
+                    encoded = np.array(encoded).mean(axis=1)
                 else:
-                    encoded = [e[0] for e in encoded]
-                
-                score = -pearsonr(list(score_labels.values()), encoded).correlation
+                    encoded = [np.mean(e)[0] for e in encoded]
+            else:
+                encoded = [e[0] for e in encoded]
 
-        
-                gender_keys = list(config['categories'].keys())
-                category_to_invert = max(config['categories'],key=lambda cat: config['categories'][cat]['encoding'])
+            score = -pearsonr(list(score_labels), encoded).correlation
 
-                log.info(f"Category to invert: {category_to_invert}")
-                category_means = {}
+            # also compute score for encoded != 0
+            labels_unequal_0_indices = [i for i, e in enumerate(score_labels) if e != 0.0]
+            encoded_unequal_0 = [e for i, e in enumerate(encoded) if i in labels_unequal_0_indices]
+            score_labels_unequal_0 = [label for i, label in enumerate(score_labels) if i in labels_unequal_0_indices]
+            score_unequal_0 = -pearsonr(list(score_labels_unequal_0), encoded_unequal_0).correlation
 
+
+            gender_keys = list(config['categories'].keys())
+            category_to_invert = max(config['categories'], key=lambda cat: config['categories'][cat]['encoding'])
+            other_category = min(config['categories'], key=lambda cat: config['categories'][cat]['encoding'])
+            if category_to_invert == other_category:
+                raise ValueError('Category to invert and other category are the same!', category_to_invert)
+
+            log.info(f"Category to invert: {category_to_invert}")
+            category_means = {}
+
+            for gender_key in gender_keys:
+                codes = config['categories'][gender_key]['codes']
+                label_means = [np.mean([e for e, label in zip(encoded, labels) if label == code]) for code in codes]
+                category_means[gender_key] = np.mean(label_means)
+
+
+            #TODO this (what should be negative and positive) is currently decided on which article comes first in the config
+            if normalized and invert(category_to_invert, other_category, category_means) and num_dims == 1:
+                log.info(f"Invert encoding since {category_to_invert} encoded value is {category_means[category_to_invert]:.6f}")
+                model_with_gradiend.invert_encoding()
+                score = -score
+                score_unequal_0 = -score_unequal_0
                 for gender_key in gender_keys:
-                    codes = config['categories'][gender_key]['codes']
-                    label_means = [np.mean([e for e, label in zip(encoded, labels.values()) if label == code]) for code in codes]
-                    category_means[gender_key] = np.mean(label_means)
-
-        
-                
-                #TODO this (what should be negative and positive) is currently decided on which article comes first in the config
-                if normalized and invert(category_to_invert, category_means) and num_dims == 1:
-                    log.info(f"Invert encoding since {category_to_invert} encoded value is {category_means[category_to_invert]:.6f}")
-                    model_with_gradiend.invert_encoding()
-                    score = -score
-                    for gender_key in gender_keys:
-                        category_means[gender_key] = - category_means[gender_key]
-                        
-                
-                if np.isnan(score):
-                    score = 0.0
-
-                end = time.time()
-
-                log.info(f"Encoded means: {category_means}")
-                print(f'Evaluated in {(end - start):.2f}s')
-                for gender_key, mean_value in category_means.items():
-                    print(f"Mean encoded value for {gender_key}: {mean_value:6f}")
+                    category_means[gender_key] = - category_means[gender_key]
 
 
-                return score, *tuple(category_means.values())
+            if np.isnan(score):
+                score = 0.0
+                score_unequal_0 = 0.0
+
+            end = time.time()
+
+            log.info(f"Encoded means: {category_means}")
+            print(f'Evaluated in {(end - start):.2f}s')
+            for gender_key, mean_value in category_means.items():
+                print(f"Mean encoded value for {gender_key}: {mean_value:6f}")
+
+
+            return score, score_unequal_0, *tuple(category_means.values())
 
 
 
@@ -279,6 +298,8 @@ def train(model_with_gradiend,
         def evaluate():
             return None
 
+    is_llama = 'llama' in model_with_gradiend.base_model.name_or_path.lower()
+
 
     # Training loop
     start_time = time.time()
@@ -286,6 +307,7 @@ def train(model_with_gradiend,
     last_losses = []
     last_losses2 = []
     scores = []
+    scores_without_0 = []
     losses = []
     losses2 = []
     encoder_changes = []
@@ -299,6 +321,7 @@ def train(model_with_gradiend,
     convergence = None
     best_score_checkpoint = None
     score = 0.0
+    score_without_0 = 0.0
     total_training_time_start = time.time()
     training_data_prep_time = 0.0
     training_gradiend_time = 0.0
@@ -321,6 +344,12 @@ def train(model_with_gradiend,
 
     len_dataloader = len(dataloader)
     for epoch in range(epochs):
+
+        if max_iterations and global_step >= max_iterations:
+            convergence = f'max iterations ({max_iterations}) reached'
+            print(f'Stopping training since max iterations ({max_iterations}) reached')
+            break
+
         dataloader_iterator = tqdm(dataloader, desc=f'Epoch {epoch + 1}/{epochs}', leave=False)
          
 
@@ -341,6 +370,9 @@ def train(model_with_gradiend,
 
                 factual_inputs = batch[True]
                 counterfactual_inputs = batch[False]
+                inverse = batch['inverse']
+                determiner = batch['inverse']
+
 
                 factual_gradients = None
                 counterfactual_gradients = None
@@ -351,14 +383,13 @@ def train(model_with_gradiend,
                 source = source.strip()
                 target = target.strip()
 
-
                 if source in gradients_keywords or target in gradients_keywords:
                     factual_gradients = model_with_gradiend.forward_pass(factual_inputs)
 
                 if source in inv_gradients_keywords or target in inv_gradients_keywords:
-                    if multi_task: 
+                    if multi_task:
                         multi_task_counterfactual_gradients = []
-                        for counterfactual_input in counterfactual_inputs: 
+                        for counterfactual_input in counterfactual_inputs:
                             grad_output = model_with_gradiend.forward_pass(counterfactual_input)
                             multi_task_counterfactual_gradients.append(grad_output)
                     else:
@@ -383,6 +414,9 @@ def train(model_with_gradiend,
             if target == 'inv_gradient':
                 target_tensor = counterfactual_gradients
             elif target == 'diff':
+                # if config neutral augmented and this is neutral augmented batch, actually use factual
+
+
                 if multi_task:
                     target_tensors = []
                     for counterfactual_gradient in multi_task_counterfactual_gradients:
@@ -469,9 +503,21 @@ def train(model_with_gradiend,
                 
 
                 loss_ae = loss_ae / accumulation_steps
+                if is_llama:
+                    del batch
+                    del encoded_value
+                    # free memory
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
-                loss_ae.backward()
-                
+                if loss_ae is not None:
+                    # this could be the case, e.g., if the mask is outside of the input (should rarely happend)
+                    loss_ae.backward()
+
+                if is_llama:
+                    del outputs_ae
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
         
                 if (i + 1) % accumulation_steps == 0  or (i + 1 == len(dataloader)):
@@ -503,8 +549,9 @@ def train(model_with_gradiend,
             last_iteration = global_step == max_iterations or (epoch == epochs - 1 and i == len_dataloader - 1)
             if do_eval and ((i+1) % n_evaluation == 0 or i == 0)or last_iteration:
                 eval_start = time.time()
-                score, mean_male, mean_female, *rest = evaluate()
+                score, score_without_0, mean_male, mean_female, *rest = evaluate()
                 scores.append(score)
+                scores_without_0.append(score_without_0)
                 mean_males.append(mean_male)
                 mean_females.append(mean_female)
                 eval_time += time.time() - eval_start
@@ -517,7 +564,7 @@ def train(model_with_gradiend,
                 encoder_norm = model_with_gradiend.gradiend.encoder_norm
                 decoder_norm = model_with_gradiend.gradiend.decoder_norm
                 avg_grad_norm = model_with_gradiend.gradiend.avg_gradient_norm
-                output_str = f'Epoch [{epoch + 1}/{epochs}], Loss AE: {mean_loss:.10f}, Correlation score: {score:.6f}, encoder {encoder_norm}, decoder {decoder_norm}, avg grad norm {avg_grad_norm}'
+                output_str = f'Epoch [{epoch + 1}/{epochs}], Loss AE: {mean_loss:.10f}, Correlation score: {score:.6f} (without 0 {score_without_0:.6f}), encoder {encoder_norm}, decoder {decoder_norm}, avg grad norm {avg_grad_norm}'
                 if hasattr(model_with_gradiend.gradiend, 'encoder_change'):
                     encoder_change = model_with_gradiend.gradiend.encoder_change
                     decoder_change = model_with_gradiend.gradiend.decoder_change
@@ -560,6 +607,7 @@ def train(model_with_gradiend,
                         'layers': model_with_gradiend.gradiend.layers,
                         'score': score,
                         'scores': scores,
+                        'scores_without_0': scores_without_0,
                         'mean_males': mean_males,
                         'mean_females': mean_females,
                         'losses': losses,
@@ -644,10 +692,6 @@ def train(model_with_gradiend,
         model_with_gradiend.gradiend.save_pretrained(output, training=training_information)
         print('Saved the auto encoder model as', output)
         print('Best score:', best_score_checkpoint)
-        if epochs > 1:
-            output_epoch = f'{output}_epoch_{epoch + 1}'
-            model_with_gradiend.save_pretrained(output_epoch, training=training_information)
-
 
         try:
             import humanize
@@ -686,6 +730,12 @@ def train(model_with_gradiend,
         os.rename(f'{output}_best', output)
 
 
+    # save metrics.json containing metric value in output
+    metrics_file = os.path.join(output, 'metrics_train.json')
+    import json
+    with open(metrics_file, 'w') as f:
+        json.dump(score, f)
+
     print('Saved the auto encoder model as', output)
     return output
 
@@ -693,6 +743,16 @@ def create_bert_with_ae(model, layers=None, activation='tanh', activation_decode
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
+
+    if isinstance(torch_dtype, str):
+        if torch_dtype == 'float16':
+            torch_dtype = torch.float16
+        elif torch_dtype == 'bfloat16':
+            torch_dtype = torch.bfloat16
+        elif torch_dtype == 'float32':
+            torch_dtype = torch.float32
+        else:
+            raise ValueError(f"Unsupported torch dtype: {torch_dtype}")
 
     kwargs['torch_dtype'] = torch_dtype
     return ModelWithGradiend.from_pretrained(model, layers, activation=activation, activation_decoder=activation_decoder, bias_decoder=bias_decoder, grad_iterations=grad_iterations, decoder_factor=decoder_factor, torch_dtype=torch_dtype, latent_dim=num_dims), kwargs

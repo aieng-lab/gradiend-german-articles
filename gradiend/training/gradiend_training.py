@@ -6,13 +6,12 @@ import time
 import numpy as np
 import torch
 
-from gradiend.evaluation.analyze_encoder import analyze_models, get_model_metrics
-from gradiend.evaluation.encoder.de_encoder_analysis import DeEncoderAnalysis
+from gradiend.evaluation.analyze_encoder import analyze_models
 from gradiend.evaluation.select_models import select
 from gradiend.training import train_all_layers_gradiend, train_multiple_layers_gradiend, PolarFeatureLoss
 
 
-def train(base_model,config, model_config, dim, n=3, metric='pearson', multi_task=False, force=False, version=None, clear_cache=False):
+def train(base_model,config, model_config, dim, n=3, metric='pearson', multi_task=False, force=True, version=None, clear_cache=False):
     det_combination = config['plot_name']
     lr =model_config['lr']
     epochs = model_config['epochs']
@@ -93,7 +92,6 @@ if __name__ == '__main__':
     for base_model, model_config in model_configs.items():
         model = train(base_model, model_config, n=3, version='', clear_cache=False, force=False)
         models.append(model)
-
 
     for model in models:
         select(model)

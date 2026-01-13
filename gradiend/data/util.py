@@ -28,17 +28,18 @@ def json_dumps(x):
 
     return json.dumps(x)
 
-def get_default_prediction_file_name(model):
+def get_default_prediction_file_name(model, combinations=None):
     model_name = model.name_or_path if hasattr(model, 'name_or_path') else model
-    return f'data/cache/default_predictions_{model_name}.csv'
+    combinations_suffix = f'__{"_".join(sorted(combinations))}' if combinations else ""
+    return f'data/cache/default_predictions_{model_name}{combinations_suffix}.csv'
 
 def get_available_models(prefix=''):
     # return all directories in results/models with the given prefix
     return [name for name in os.listdir('results/models') if os.path.isdir(f'results/models/{name}') and name.startswith(prefix)]
 
 
-def read_default_predictions(model):
-    file = get_default_prediction_file_name(model)
+def read_default_predictions(model, combinations=None):
+    file = get_default_prediction_file_name(model, combinations=combinations)
     try:
         cache_default_predictions = pd.read_csv(file)
         cache_default_predictions.set_index('text', inplace=True)
@@ -52,8 +53,8 @@ def read_default_predictions(model):
     return cache_default_predictions_dict
 
 
-def write_default_predictions(default_predictions, model):
-    file = get_default_prediction_file_name(model)
+def write_default_predictions(default_predictions, model, combinations=None):
+    file = get_default_prediction_file_name(model, combinations=combinations)
     # Ensure the directory exists
     directory = os.path.dirname(file)
     if not os.path.exists(directory):
@@ -88,6 +89,8 @@ def enrich_with_plurals(input_dict):
 
 #TODO this is duplicated code from analyze_encoder
 def get_file_name(base_file_name, file_format=None, **kwargs):
+    #kwargs['v'] = 2 # todo remove version number!
+
     base_name = os.path.basename(base_file_name)
     output = str(base_file_name)
     if '.' in base_name[-5:]:

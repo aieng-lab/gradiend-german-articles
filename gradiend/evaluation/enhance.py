@@ -65,7 +65,7 @@ if __name__ == '__main__':
     tokenizer = BertTokenizer.from_pretrained(model_name)
     ae_model = 'results/models/ae17_tanh_target_diff_lr3_best'
     bert_with_ae = ModelWithGradiend.from_pretrained(ae_model)
-    enhanced_model = bert_with_ae.modify_model(gender_factor=0, lr=-0.013)
+    enhanced_model = bert_with_ae.modify_model(feature_factor=0, lr=-0.013)
 
     masked_word = "He"
     evaluate(model, tokenizer, masked_text, masked_word)

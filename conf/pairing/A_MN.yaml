@@ -1,0 +1,25 @@
+plot_name: 'A_MN'
+palette:  {'M': 'blue','N': 'orange'}
+categories:
+  M: 
+    labels: [AM]
+    articles: [den]
+    codes: [0]
+    encoding: -1
+  N: 
+    labels: [AN]
+    articles: [das]
+    codes: [1]
+    encoding: 1
+combinations: [AM, AN]
+articles:  ['das', 'den']
+AM: 
+  mask: '[DEN_ARTICLE]'
+  inverse: 'das' 
+  code: 0
+  encoding: -1
+AN: 
+  mask: '[DAS_ARTICLE]'
+  inverse: 'den' 
+  code: 1
+  encoding: 1

@@ -1,0 +1,7 @@
+plot_name: 'AD_N'
+palette:  {'D': 'purple','A': 'orange'}
+categories:
+  A:
+    labels: [AN]
+  D:
+    labels: [DN]

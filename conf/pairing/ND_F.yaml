@@ -1,0 +1,7 @@
+plot_name: 'ND_F'
+palette:  {'N': 'purple','D': 'orange'}
+categories:
+  N:
+    labels: [NF]
+  D:
+    labels: [DF]

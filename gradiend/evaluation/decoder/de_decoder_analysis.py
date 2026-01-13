@@ -1,30 +1,70 @@
 import csv
 import os
+import random
+
 import pandas as pd
 import torch
 from torch import device, softmax
+from tqdm import tqdm
 
 from gradiend.evaluation.decoder.decoder_analysis import DecoderAnalysis
 from gradiend.evaluation.mlm import evaluate_clm_perplexity, evaluate_mlm
-from gradiend.data import read_de_neutral
+from gradiend.data import read_de_neutral, read_article_ds
 
 from itertools import chain
 from typing import Tuple
 import numpy as np
 import torch
-import os
 import logging
+from gradiend.model import ModelWithGradiend
+from gradiend.training.decoder_only_mlm.model import DecoderModelWithMLMHead
+import os
 import pandas as pd
-from gradiend.model import ModelWithGradiend
-from gradiend.model import ModelWithGradiend
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 log = logging.getLogger(__name__)
+
+
+import re
+
+def extract_noun_after_mask(masked, tokenizer, n=6):
+    tail = masked.split(tokenizer.mask_token, 1)[-1]
+
+    # tokenize very simply on whitespace
+    tokens = tail.strip().split()
+
+    for tok in tokens[:n]:
+        # stop conditions: hard boundary ⇒ noun no longer belongs to article
+        if re.search(r"[.!?()\[\]{}]", tok):
+            break
+
+        # clean punctuation from start and end
+        clean = tok.strip(".,:;!?()[]{}\"'")
+
+        if not clean:
+            continue
+
+        # German noun heuristic: starts with capital letter
+        if clean[0].isupper():
+            return clean   # ✅ found valid noun
+
+    return ""  # ✅ no suitable noun found
+
+
+def norm(tok):
+    return tok.lower().lstrip("##").lstrip("▁").lstrip("Ġ").strip()
 
 
 class DeDecoderAnalysis(DecoderAnalysis):
 
     def __init__(self, model, tokenizer):
         super().__init__()
+        if isinstance(model, DecoderModelWithMLMHead):
+            model = model.decoder
+            tokenizer.mask_token_id = None
+            tokenizer.mask_token = None
 
         self.pad_token_id = tokenizer.pad_token_id
         self.cls_token_id = tokenizer.cls_token_id
@@ -528,9 +568,383 @@ class DeDecoderAnalysis(DecoderAnalysis):
 
         return compute_metrics(output_data_df)
 
+    @property
+    def is_clm(self):
+        return self.tokenizer.mask_token_id is None
+
+    def get_logits_and_logprobs(self, text: str):
+        tokenized = self.tokenizer(text, return_tensors="pt").to(self.device)
+
+        with torch.no_grad():
+            out = self.model(**tokenized)
+            logits = out.logits  # (1, T, V)
+
+        if self.is_clm:
+            # CLM: next-token
+            logits = logits[0, -1]
+        else:
+            # MLM
+            mask_idx = (
+                    tokenized["input_ids"] == self.tokenizer.mask_token_id
+            )[0].nonzero(as_tuple=True)[0]
+            logits = logits[0, mask_idx].squeeze(0)
+
+        log_probs = torch.log_softmax(logits, dim=-1)
+        return logits, log_probs, tokenized
+
+    def prepare_input(self, masked: str, mask_placeholder: str):
+        if self.is_clm:
+            # CLM
+            return masked.replace(mask_placeholder, "").rstrip()
+        else:
+            # MLM
+            return masked.replace(mask_placeholder, self.tokenizer.mask_token)
+
+    def evaluate_article_probabilities(self, batch_size=32):
+        base_articles = ['der', 'die', 'das', 'den', 'dem', 'des']
+
+        vocab = self.tokenizer.get_vocab()
+        article_ids = {
+            art: [tid for tok, tid in vocab.items() if tok.lower().strip() == art]
+            for art in base_articles
+        }
+
+        is_decoder_only = self.tokenizer.mask_token is None
+
+        df_data = []
+        all_cases = ['N', 'A', 'D', 'G']
+        all_genders = ['M', 'F', 'N']
+        all_articles = [case + gender for case in all_cases for gender in all_genders]
+
+        for article in all_articles:
+            df = read_article_ds(article=article, split='test')
+            #if len(df) > 100:
+            #    df = df.sample(n=100, random_state=42).reset_index(drop=True)
+
+            label = df['label'].iloc[0].lower()
+            mask = f"[{label.upper()}_ARTICLE]"
+            df = df[df['token_count'] == 1].reset_index(drop=True)
+
+            inputs, nouns = [], []
+
+            for _, entry in df.iterrows():
+                if is_decoder_only:
+                    # keep only LEFT context
+                    left_context = entry['masked'].split(mask)[0].strip()
+                    inputs.append(left_context)
+                else:
+                    inputs.append(
+                        entry['masked'].replace(mask, self.tokenizer.mask_token)
+                    )
+
+                nouns.append(extract_noun_after_mask(entry['masked'], self.tokenizer))
+
+            for start in range(0, len(inputs), batch_size):
+                batch_inputs = inputs[start:start + batch_size]
+                batch_nouns = nouns[start:start + batch_size]
+
+                tokenized = self.tokenizer(
+                    batch_inputs,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True
+                ).to(self.device)
+
+                with torch.no_grad():
+                    outputs = self.model(**tokenized)
+                    logits = outputs.logits  # (B, T, V)
+
+                input_ids = tokenized["input_ids"]
+
+                for i in range(input_ids.size(0)):
+                    if is_decoder_only:
+                        # next-token prediction
+                        last_idx = (input_ids[i] != self.tokenizer.pad_token_id).sum() - 1
+                        preds = logits[i, last_idx]  # (V,)
+                    else:
+                        mask_idx = (input_ids[i] == self.tokenizer.mask_token_id).nonzero(as_tuple=True)[0]
+                        preds = logits[i, mask_idx].squeeze(0)  # (V,)
+
+                    probs = torch.softmax(preds, dim=-1)
+
+                    article_probs = {
+                        art: float(probs[ids].sum().item())
+                        for art, ids in article_ids.items()
+                    }
+
+                    pred = self.tokenizer.convert_ids_to_tokens(
+                        torch.argmax(probs).item()
+                    )
+
+                    pred_prob = float(torch.max(probs).item())
+
+                    df_data.append({
+                        'ds': article,
+                        'label': label,
+                        'pred': pred,
+                        'pred_prob': pred_prob,
+                        'noun': batch_nouns[i],
+                        **article_probs,
+                    })
+
+        return pd.DataFrame(df_data)
+
+    def clm_lms(self, tokenized):
+        """
+        Returns:
+          total_logprob, avg_logprob, perplexity
+        """
+        with torch.no_grad():
+            out = self.model(**tokenized, labels=tokenized["input_ids"])
+            # HF loss = mean negative log-likelihood
+            nll = out.loss
+
+        ppl = torch.exp(nll).item()
+        return {
+            "lms": -nll.item() * tokenized["input_ids"].size(1),
+            "avg_logprob": -nll.item(),
+            "perplexity": ppl,
+        }
+
+    def evaluate_article_probabilities(self, batch_size=32, max_size=None):
+        base_articles = ['der', 'die', 'das', 'den', 'dem', 'des']
+        is_clm = self.tokenizer.mask_token_id is None
+
+        article_ids = {
+            art: [
+                tid for tok, tid in self.tokenizer.get_vocab().items()
+                if tok.replace('Ġ', '').lower().strip() == art
+            ]
+            for art in base_articles
+        }
+
+        df_data = []
+        all_cases = ['N', 'A', 'D', 'G']
+        all_genders = ['M', 'F', 'N']
+        all_articles = [c + g for c in all_cases for g in all_genders]
+
+        for article in all_articles:
+            print(f"Processing article: {article}")
+            df = read_article_ds(article=article, split="test")
+            df = df[df["token_count"] == 1].reset_index(drop=True)
+
+            if max_size is not None:
+                df = df.sample(n=min(len(df), max_size), random_state=42).reset_index(drop=True)
+
+            label = df["label"].iloc[0].lower()
+            mask = f"[{label.upper()}_ARTICLE]"
+
+            texts, nouns = [], []
+            for _, entry in df.iterrows():
+                masked = entry["masked"]
+                if is_clm:
+                    text = masked.split(mask)[0].rstrip()
+
+                else:
+                    text = masked.replace(mask, self.tokenizer.mask_token)
+                texts.append(text)
+                nouns.append(extract_noun_after_mask(masked, self.tokenizer))
+
+            for start in range(0, len(texts), batch_size):
+                batch_texts = texts[start:start + batch_size]
+                batch_nouns = nouns[start:start + batch_size]
+
+                tokenized = self.tokenizer(
+                    batch_texts,
+                    return_tensors="pt",
+                    padding=True,
+                ).to(self.device)
+
+                with torch.no_grad():
+                    out = self.model(**tokenized)
+                    logits = out.logits
+
+                if is_clm:
+                    probs = torch.softmax(logits[:, -1, :], dim=-1)
+                else:
+                    mask_idx = (tokenized["input_ids"] == self.tokenizer.mask_token_id)
+                    probs = torch.zeros(
+                        logits.size(0), logits.size(-1), device=logits.device
+                    )
+                    for i in range(logits.size(0)):
+                        idx = mask_idx[i].nonzero(as_tuple=True)[0]
+                        probs[i] = torch.softmax(logits[i, idx], dim=-1)
+
+                for i in range(probs.size(0)):
+                    p = probs[i]
+                    article_scores = {
+                        art: float(p[ids].sum().item()) if ids else 0.0
+                        for art, ids in article_ids.items()
+                    }
+
+                    pred = self.tokenizer.convert_ids_to_tokens(torch.argmax(p).item())
+
+                    row = {
+                        "ds": article,
+                        "label": label,
+                        "pred": pred,
+                        "noun": batch_nouns[i],
+                        **article_scores,
+                    }
+
+                    if is_clm:
+                        with torch.no_grad():
+                            out_full = self.model(
+                                input_ids=tokenized["input_ids"][i:i + 1],
+                                labels=tokenized["input_ids"][i:i + 1],
+                            )
+                        row["perplexity"] = float(torch.exp(out_full.loss).item())
+
+                    df_data.append(row)
+
+        return pd.DataFrame(df_data)
+
+    def evaluate_on_neutral(self, neutral_df, batch_size=16):
+        """
+        MLM (UNVERÄNDERT):
+          - mask one neutral token
+          - probs from [MASK] position
+
+        CLM (VERBESSERT):
+          - score ALL valid tokens autoregressively
+          - aggregate gender probe probs over sequence
+          - compute perplexity from same forward pass
+        """
+
+        #neutral_df = neutral_df.head(1000)
+
+
+        no_mask_tokens = {
+            'der', 'die', 'das', 'den', 'dem', 'des',
+            'ein', 'eine', 'einer', 'einem', 'eines', 'einen',
+            'dieser', 'diese', 'dieses', 'diesen', 'diesem',
+            'jede', 'jeder', 'jedes', 'jenem', 'jenen'
+        }
+
+        def _norm(tok):
+            return tok.lower().lstrip("##").lstrip("▁").lstrip("Ġ").strip()
+
+        vocab = self.tokenizer.get_vocab()
+        probe_tokens = ['der', 'die', 'das', 'den', 'dem', 'des']
+
+        probe_token_ids = {
+            tok: [tid for t, tid in vocab.items() if _norm(t) == tok]
+            for tok in probe_tokens
+        }
+
+        is_clm = self.tokenizer.mask_token_id is None
+        rows = []
+
+        for i in range(0, len(neutral_df), batch_size):
+            batch_texts = neutral_df["text"].iloc[i:i + batch_size].tolist()
+
+            tokenized = self.tokenizer(
+                batch_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                return_special_tokens_mask=True
+            ).to(self.device)
+
+            input_ids = tokenized["input_ids"]
+            special_mask = tokenized["special_tokens_mask"]
+
+            # =====================
+            # CLM (NEW LOGIC ONLY)
+            # =====================
+            if is_clm:
+                with torch.no_grad():
+                    outputs = self.model(input_ids=input_ids)
+                    logits = outputs.logits  # (B, T, V)
+
+                log_probs = torch.log_softmax(logits[:, :-1], dim=-1)
+                targets = input_ids[:, 1:]
+                valid_mask = special_mask[:, 1:] == 0
+
+                token_log_probs = log_probs.gather(
+                    -1, targets.unsqueeze(-1)
+                ).squeeze(-1)
+
+                for b in range(input_ids.size(0)):
+                    mask_b = valid_mask[b]
+                    if mask_b.sum() == 0:
+                        continue
+
+                    row = {
+                        "text": batch_texts[b],
+                        "perplexity": float(
+                            torch.exp(-token_log_probs[b][mask_b].mean()).item()
+                        )
+                    }
+
+                    probs_all = torch.softmax(logits[b, :-1], dim=-1)
+
+                    for tok, ids in probe_token_ids.items():
+                        row[f"prob_{tok}"] = (
+                            probs_all[:, ids].sum(-1)[mask_b].mean().item()
+                            if ids else 0.0
+                        )
+
+                    rows.append(row)
+
+            # =====================
+            # MLM (UNCHANGED)
+            # =====================
+            else:
+                input_ids_mlm = input_ids.clone()
+
+                target_positions = []
+                original_token_ids = []
+
+                for b in range(input_ids_mlm.size(0)):
+                    tokens = self.tokenizer.convert_ids_to_tokens(input_ids_mlm[b])
+                    candidates = [
+                        idx for idx, t in enumerate(tokens)
+                        if special_mask[b, idx] == 0
+                           and _norm(t) not in no_mask_tokens
+                    ]
+
+                    if not candidates:
+                        target_positions.append(None)
+                        original_token_ids.append(None)
+                        continue
+
+                    pos = random.choice(candidates)
+                    target_positions.append(pos)
+                    original_token_ids.append(input_ids_mlm[b, pos].item())
+                    input_ids_mlm[b, pos] = self.tokenizer.mask_token_id
+
+                with torch.no_grad():
+                    outputs = self.model(input_ids=input_ids_mlm)
+                    logits = outputs.logits
+
+                for b, pos in enumerate(target_positions):
+                    if pos is None:
+                        continue
+
+                    probs = torch.softmax(logits[b, pos], dim=-1)
+                    orig_id = original_token_ids[b]
+
+                    row = {
+                        "text": batch_texts[b],
+                        "label": self.tokenizer.convert_ids_to_tokens(orig_id),
+                        "pred": self.tokenizer.convert_ids_to_tokens(
+                            torch.argmax(probs).item()
+                        ),
+                        "prob_masked": float(probs[orig_id].item()),
+                    }
+
+                    for tok, ids in probe_token_ids.items():
+                        row[f"prob_{tok}"] = (
+                            float(probs[ids].sum().item()) if ids else 0.0
+                        )
+
+                    rows.append(row)
+
+        return pd.DataFrame(rows)
 
 def evaluate_model_with_ae(
-    model_path: str, eval_csv: str, output_csv: str, gender_factors=None, lrs=None
+    model_path: str, eval_csv: str, output_csv: str, feature_factors=None, lrs=None
 ):
     """
     Run agreement and likelihood evaluation for multiple gender factors and learning rates.
@@ -539,13 +953,13 @@ def evaluate_model_with_ae(
         model_path (str): Path to pretrained model directory.
         eval_csv (str): Path to CSV with evaluation data.
         output_csv (str): Path where results should be saved.
-        gender_factors (list, optional): Gender factors to test. Default spans [-10, -2, -1, ..., 10].
+        feature_factors (list, optional): Gender factors to test. Default spans [-10, -2, -1, ..., 10].
         lrs (list, optional): Learning rates to test. Default spans [-1, -0.95, ..., 1].
     """
 
     log.info(f"Evaluating {model_path}")
-    if gender_factors is None:
-        gender_factors = [
+    if feature_factors is None:
+        feature_factors = [
             -10,
             -2,
             -1,
@@ -589,42 +1003,83 @@ def evaluate_model_with_ae(
             1,
         ]
 
-    pairs = {(g_f, lr) for g_f in gender_factors for lr in lrs}
+    pairs = {(g_f, lr) for g_f in feature_factors for lr in lrs}
 
     # Load model + tokenizer
     base_model = ModelWithGradiend.from_pretrained(model_path)
     eval_data = pd.read_csv(eval_csv)
 
     results = []
+    results_probs = []
 
-    for g_f, lr in pairs:
+    t = tqdm(pairs, desc="Evaluating models")
+    for g_f, lr in t:
+        t.set_postfix({"lr": lr, "gf": g_f})
+
         # Modify model
         enhanced_model = base_model.modify_model(
-            lr=lr, gender_factor=g_f, top_k=None, part="decoder", top_k_part="decoder"
+            lr=lr, feature_factor=g_f, top_k=None, part="decoder", top_k_part="decoder"
         )
 
         decoder_analysis = DeDecoderAnalysis(enhanced_model, base_model.tokenizer)
 
         # Evaluate
+        article_probs = decoder_analysis.evaluate_article_probabilities()
+        article_probs["gf"] = g_f
+        article_probs["lr"] = lr
+        results_probs.append(article_probs)
+
         lls = decoder_analysis.evaluate_non_gender_mlm()
         output = decoder_analysis.evaluate_single_locus_grammaticality(eval_data)
 
         # Add config info
-        output["g_f"] = g_f
+        output["gf"] = g_f
         output["lr"] = lr
-        output["lls"] = lls
+        for k, v in lls.items():
+            output[k] = v
 
-        print(output)
         results.append(output)
 
     results_df = pd.DataFrame(results)
-    cols = ["g_f", "lr"] + [c for c in results_df.columns if c not in ["g_f", "lr"]]
+    cols = ["gf", "lr"] + [c for c in results_df.columns if c not in ["gf", "lr"]]
     results_df = results_df[cols]
 
     # Save
     results_df.to_csv(output_csv, index=False)
+    probs_df = pd.concat(results_probs, ignore_index=True)
+    probs_output_csv = output_csv.replace(".csv", "_article_probs.csv")
+    probs_df.to_csv(probs_output_csv, index=False)
 
     return results_df
+
+def plot_article_probs_single_articles(input_df):
+    df = pd.read_csv(input_df)
+
+    articles = ['der', 'die', 'das', 'den', 'dem', 'des']
+    datasets = sorted(df['ds'].unique().tolist())
+    lr_values = sorted(df['lr'].unique().tolist())
+
+    # One figure per article
+    for art in articles:
+        plt.figure(figsize=(7, 5))
+
+        # Line plot: one line per datasets
+        for ds_name in datasets:
+            sub = df[df['ds'] == ds_name]
+            # Mean over nouns per lr step
+            grouped = sub.groupby('lr')[art].mean().reset_index()
+
+            plt.plot(grouped['lr'], grouped[art], marker='o', label=ds_name)
+
+        plt.title(f"Probability of article '{art}'")
+        plt.xlabel(r"Learning rate $\alpha$")
+        plt.ylabel("Mean probability")
+        plt.legend(title="Dataset")
+        plt.grid(True, alpha=0.3)
+        # log scale for x axis
+        plt.xscale("symlog", linthresh=0.0)
+        plt.tight_layout()
+        plt.show()
 
 
 def diff(a, b):
@@ -643,14 +1098,21 @@ def compute_metrics(output_data):
         output_data["gram_adj_score"] > output_data["ugram_adj_score"]
     ).mean()
 
-    grouped_sent_acc = output_data.groupby("gender").apply(
-        lambda x: (x["gram_sent_prob"] > x["ungram_sent_prob"]).mean()
+    grouped_sent_acc = (
+        output_data
+        .groupby("gender")[["gram_sent_prob", "ungram_sent_prob"]]
+        .apply(lambda x: (x["gram_sent_prob"] > x["ungram_sent_prob"]).mean())
     )
-    grouped_det_acc = output_data.groupby("gender").apply(
-        lambda x: (x["gram_det_score"] > x["ungram_det_score"]).mean()
+    grouped_det_acc = (
+        output_data
+        .groupby("gender")[["gram_det_score", "ungram_det_score"]]
+        .apply(lambda x: (x["gram_det_score"] > x["ungram_det_score"]).mean())
     )
-    grouped_adj_acc = output_data.groupby("gender").apply(
-        lambda x: (x["gram_adj_score"] > x["ugram_adj_score"]).mean()
+
+    grouped_adj_acc = (
+        output_data
+        .groupby("gender")[["gram_adj_score", "ugram_adj_score"]]
+        .apply(lambda x: (x["gram_adj_score"] > x["ugram_adj_score"]).mean())
     )
 
     output_data["certainty_sent_overall"] = output_data.apply(
@@ -704,33 +1166,3 @@ def compute_metrics(output_data):
     }
 
 
-from minicons import scorer
-if __name__ == "__main__":
-    default_evaluation_gender_factors = [-1]
-    default_evaluation_lrs = [-5e-2]
-
-    model_scorer = scorer.MaskedLMScorer('bert-base-german-cased', 'gpu' if torch.cuda.is_available() else 'cpu')
-
-    # distilbert_model_path = "results/experiments/gradiend/MF/3e-05/distilbert-base-german-cased/1"
-    # pairs = {(gender_factor, lr) for gender_factor in default_evaluation_gender_factors for lr in default_evaluation_lrs}
-    # bert_with_ae = ModelWithGradiend.from_pretrained(distilbert_model_path)
-    # eval_data = pd.read_csv("masked_NP.csv")
-
-    distilbert_model_path = (
-        "results/experiments/gradiend/MF/1e-05/bert-base-german-cased/0"
-    )
-    pairs = {
-        (gender_factor, lr)
-        for gender_factor in default_evaluation_gender_factors
-        for lr in default_evaluation_lrs
-    }
-    bert_with_ae = ModelWithGradiend.from_pretrained(distilbert_model_path)
-    eval_data = pd.read_csv("gradiend/data/der_die_das/eval/masked_NP.csv")
-
-    evaluate_model_with_ae(
-        model_path=distilbert_model_path,
-        eval_csv="gradiend/data/der_die_das/eval/masked_NP.csv",
-        output_csv="masked_NP_results.csv",
-        gender_factors=default_evaluation_gender_factors,
-        lrs=default_evaluation_lrs,
-    )

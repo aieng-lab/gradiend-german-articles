@@ -42,10 +42,9 @@ def load_german_wiki_data(dataset_name="wikipedia", local=False, split='train', 
     logger.info("Texts loaded")
     return german_texts
 
-#TODO: refactor this so it work with setences only.
 def filter_wiki_texts(inputs, article, case, pos,  output_dir, mask, num_samples = 20000):
     """
-    :param inputs: the dataset containing the sentences.
+    :param inputs: the datasets containing the sentences.
     :param article: one of the german articles e.g. der.
     :param case: the case of the article, e.g. NOM, should correspond to the spaCy case notation.
     :param pos:  the part of speech of the article, e.g. DET, should correspond tho the spaCy pos notation.
@@ -82,7 +81,7 @@ def filter_wiki_texts(inputs, article, case, pos,  output_dir, mask, num_samples
     create_filtered_set(filtered_sentences, article.upper() ,mask, output_dir)
 
 
-def filter_article(sentences, article, cases, pos, mask, output_dir, gender, dataset_label,number,num_samples = 10000, isDas= False):
+def filter_article(sentences, article, cases, pos, mask, output_dir, gender, dataset_label,number,num_samples = None, isDas= False):
     """
     Filters sentences based on the specified article, cases, part of speech.
     sentences: the list of sentences to filter.
@@ -111,7 +110,7 @@ def filter_article(sentences, article, cases, pos, mask, output_dir, gender, dat
             if len(doc.ents) > 3 :continue
             else:
                 article_tokens = [token for token in doc if token.text.lower() == article and token.pos_ == pos]
-                if 0 < len(article_tokens) < 5 and all(token.morph.get("Case") in ([case] for case in cases) and token.morph.get("Gender") == gender and token.morph.get("Number") == number for token in article_tokens):   
+                if 0 < len(article_tokens) < 5 and all(token.morph.get("Case") in [[case] for case in cases] and token.morph.get("Gender") == [gender] and token.morph.get("Number") == [number] for token in article_tokens):
                     if isDas:     
                         modified_sent = modify_das_pron(sent)
                         filtered_sentences.append(modified_sent)
@@ -119,7 +118,7 @@ def filter_article(sentences, article, cases, pos, mask, output_dir, gender, dat
                         filtered_sentences.append(sent)
 
     logger.warning(f"Filtered {len(filtered_sentences)} sentences for article: {article}.")
-    if len(filtered_sentences) > num_samples:
+    if num_samples and len(filtered_sentences) > num_samples:
         random.seed(42)
         filtered_sentences = random.sample(filtered_sentences, num_samples)
 
@@ -144,14 +143,13 @@ def modify_das_pron(sent):
 def create_wiki_sentences(wiki_texts):
     wiki_sentences = []
 
-    for entry in tqdm(wiki_texts['train']):
-        sentences = [sent.text.strip() for sent in nlp(entry.get("text")).sents]
+    for entry in tqdm(wiki_texts):
+        sentences = [sent.text.strip() for sent in nlp(entry).sents]
         wiki_sentences.extend(sentences)
 
     #TODO: change to info -> config has to be changed so it actually prints 
     logger.info(f"{len(wiki_sentences)} sentences were created.")
     return wiki_sentences
-
 
 
 def save_file_w_json(input, output_dir):
@@ -162,11 +160,9 @@ def save_file_w_json(input, output_dir):
 
 
 def create_filtered_set(inputs,label, mask, output_dir, dataset_label):
-    
     article = label.lower()  # ensure that the article is in lowercase
     article_regex = rf"\b{re.escape(article)}\b"
     regex_pattern = re.compile(article_regex, re.IGNORECASE)
-
 
     columns = ['id', 'text', 'masked', 'label', 'token_count', 'dataset_label']
     row_id = 0
@@ -204,8 +200,6 @@ def create_filtered_set(inputs,label, mask, output_dir, dataset_label):
 
 
 
-
-
 def substitute_das_det(text):
     # Replace sentence-start 'das_det' with 'Das'
     text = re.sub(r'(^\s*)(das_det)\b', r'\1Das', text)
@@ -227,17 +221,50 @@ def filter_ner(sentence):
         return True
 
 
-#import threading
+def generate_data(use_wiki_data=True):
+    if use_wiki_data:
+        wiki_data = load_german_wiki_data()
+        sentences = create_wiki_sentences(wiki_data)
+    else:
+        # this dataset should work better for direct MFN training
+        # load https://downloads.wortschatz-leipzig.de/corpora/deu_news_2024_300K.tar.gz
+        leipzig_dataset = pd.read_csv("gradiend/data/der_die_das/deu_news_2024_300K/deu_news_2024_300K.txt")
+        sentences = leipzig_dataset['text'].tolist()
 
-if __name__ == '__main__':
+    case_gender_mapping = {
+        'Nom': {'Fem': 'die', 'Masc': 'der', 'Neut': 'das'},  # Nominativ
+        'Gen': {'Fem': 'der', 'Masc': 'des', 'Neut': 'des'},  # Genitiv
+        'Acc': {'Fem': 'die', 'Masc': 'den', 'Neut': 'das'},  # Akkusativ
+        'Dat': {'Fem': 'der', 'Masc': 'dem', 'Neut': 'dem'},  # Dativ
+    }
 
+    leipzig_str = '' if use_wiki_data else 'leipzig/'
+
+    for case, gender_data in case_gender_mapping.items():
+        for gender, article in gender_data.items():
+            dataset_label = f"{case[0].upper()}{gender[0].upper()}"
+            output_dir = f'data_test/der_die_das/splits_no_limit/{leipzig_str}'
+            filter_article(
+                sentences,
+                article=article,
+                cases=[case],
+                pos='DET',
+                mask=f"[{article.upper()}_MASK]",
+                output_dir=output_dir,
+                gender=gender,
+                dataset_label=dataset_label,
+                number='Sing',
+                isDas=(article == 'das'),
+            )
+
+
+def some_leipzig_filtering():
     suffix = ['train', 'test', 'val']
 
     gram_categories = ['AM', 'AN', 'AF', 'NM', 'NF', 'NN']
 
-
-    for gram_cat in gram_categories: 
-        for s in suffix: 
+    for gram_cat in gram_categories:
+        for s in suffix:
             source_csv_path = f'gradiend/data/der_die_das/splits/leipzig/{gram_cat}/filtered_{gram_cat}_{s}.csv'
             df = pd.read_csv(source_csv_path)
             half_indices = random.sample(list(df.index), k=len(df) // 2)
@@ -245,11 +272,17 @@ if __name__ == '__main__':
 
             directory = f'gradiend/data/der_die_das/splits/MFN/leipzig/{gram_cat}_mfn'
 
-            if not os.path.exists(directory): 
+            if not os.path.exists(directory):
                 os.makedirs(directory)
 
             target_csv_path = f'{directory}/filtered_{gram_cat}_{s}.csv'
 
             df.to_csv(target_csv_path, index=False)
 
-        
+
+
+
+
+#import threading
+if __name__ == '__main__':
+    generate_data(use_wiki_data=True)

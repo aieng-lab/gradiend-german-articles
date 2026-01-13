@@ -1,15 +1,13 @@
-defaults: 
-  - mode: gradiend 
-  - pairing: FN
+defaults:
+  - mode: gradiend_encoder
+  - pairing: MN
   - _self_
 
-eval_only: false
+augment_neutral: True
+eval_only: False
 base_model: 'bert-base-german-cased'
-num_runs: 2
+num_runs: 3
 hydra:
   run: 
-    dir: output/experiments/${mode.name}/${pairing.plot_name}/dim_${mode.model_config.num_dims}_${mode.model_config.source}/${base_model}/
+    dir: logs/experiments/${mode.name}/${pairing.plot_name}/dim_${mode.model_config.num_dims}_${mode.model_config.source}/${basename:${base_model}}/
   output_subdir: null
-
-
-  

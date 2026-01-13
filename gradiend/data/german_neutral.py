@@ -1,3 +1,4 @@
+import os
 import re
 import pandas as pd
 import spacy
@@ -56,7 +57,10 @@ def filter_gendered_words(sentences):
             })
                 neutral_sentences.append(sent_dict)  
 
-    neutral_sent_df = pd.DataFrame(neutral_sentences)           
+    neutral_sent_df = pd.DataFrame(neutral_sentences)
+
+    # remove duplicates
+    neutral_sent_df = neutral_sent_df.drop_duplicates(subset=['text']).reset_index(drop=True)
 
     return neutral_sent_df
 
@@ -66,15 +70,13 @@ def contains_article(sentence):
     return bool(re.search(pattern, sentence, re.IGNORECASE))
 
 
-# if __name__ == '__main__':
+if __name__ == '__main__':
+    sentences_leipzig = pd.read_csv("data/der_die_das/deu_news_2024_300K/deu_news_2024_300K-sentences.txt", sep='\t', header=None, names=['id', 'text', 'meta'], quoting=3, engine="python")["text"]
 
-    #sentences_leipzig = pd.read_csv("ddw_300k.csv")["text"]
-        
     #wiki_sents_path = "gradiend/data/der_die_das/raw_data/wiki_sentences_extended_1m.jsonl"
     #sentences = load_dataset("json", data_files=wiki_sents_path)["train"]["text"]
 
-    #filtered_sents = filter_gendered_words(sentences_leipzig)
-
-    #filtered_sents.to_csv('neutral_set_dw_300k.csv')
-
-
+    filtered_sents = filter_gendered_words(sentences_leipzig)
+    output = 'data_test/der_die_das/neutral/neutral_dwk.csv'
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    filtered_sents.to_csv(output)

@@ -14,18 +14,20 @@ import torch
 from tabulate import tabulate
 from matplotlib import pyplot as plt
 from scipy.spatial.distance import jensenshannon
-
+from omegaconf import open_dict
 
 from gradiend.evaluation.encoder.de_encoder_analysis import DeEncoderAnalysis
 from gradiend.combined_models.combined_gradiends import CombinedEncoderDecoder
 from gradiend.model import ModelWithGradiend
 from gradiend.data import read_article_ds, read_geneutral, read_gender_data, get_gender_words, \
-    write_default_predictions, read_default_predictions, json_dumps, json_loads, read_genter, read_namexact
+    write_default_predictions, read_default_predictions, json_dumps, json_loads, read_genter, read_namexact, \
+    read_de_neutral
 from gradiend.data import read_names_data
 import seaborn as sns
 
 
-from gradiend.util import token_distance, get_files_and_folders_with_prefix, evaluate_he_she, find_outliers
+from gradiend.util import token_distance, get_files_and_folders_with_prefix, evaluate_he_she, find_outliers, \
+    case_gender_mapping
 
 
 def z_score(x, groupby=None, key=None):
@@ -399,6 +401,9 @@ def get_model_metrics(*encoded_values, prefix=None, suffix='.csv', **kwargs):
     except KeyError:
         df = df_all
 
+    min_ds_size = df.groupby('ds').size().min()
+    df = df.groupby('ds').apply(lambda group: group.sample(n=min_ds_size, random_state=42)).reset_index(drop=True)
+
     df_copy = df
     df_without_B = df[df['state'] != 'B'].copy()
 
@@ -460,7 +465,7 @@ def get_model_metrics(*encoded_values, prefix=None, suffix='.csv', **kwargs):
     pearson = get_pearson_correlation(df)
     spearman = get_spearman_correlation(df)
 
-    pearson_MF = get_pearson_correlation(df_without_B)
+    pearson = get_pearson_correlation(df_without_B)
     spearman_MF = get_spearman_correlation(df_without_B)
 
     scores = {
@@ -475,8 +480,8 @@ def get_model_metrics(*encoded_values, prefix=None, suffix='.csv', **kwargs):
         'spearmann': spearman,
         'spearman_p_value': spearman['p_value'],
 
-        'pearson_MF': pearson_MF['correlation'],
-        'pearson_MF_p_value': pearson_MF['p_value'],
+        'pearson': pearson['correlation'],
+        'pearson_p_value': pearson['p_value'],
         'spearman_MF': spearman_MF['correlation'],
         'spearman_MF_p_value': spearman_MF['p_value'],
 
@@ -1101,7 +1106,7 @@ def analyze_neurons_all_parts(model, parts=None, relative=False, q=99.99, boxplo
 
 
 
-def analyze_models(*models, config, max_size=None, force=True, split='test', prefix=None, best_score=None, multi_task=False, ensemble=False):
+def analyze_models(*models, config, max_size=None, force=False, split='test', prefix=None, best_score=None, multi_task=False, ensemble=False):
     if prefix:
         # find all models in the folder with the suffix
         best_score = '_best' if best_score else ''
@@ -1117,21 +1122,50 @@ def analyze_models(*models, config, max_size=None, force=True, split='test', pre
         df_label = read_article_ds(split=split, article=label)
         article_df.append(df_label)
 
+    min_len = min([len(d) for d in article_df])
     df = pd.concat(article_df)
+
     df = df.sample(frac=1, random_state=42).reset_index(drop=True)    
+
+    all_dfs = []
+    for gender in ['M', 'F', 'N']:
+        for case in ['N', 'A', 'D', 'G']:
+            label = case + gender
+            df_label = read_article_ds(split=split, article=label)
+            all_dfs.append(df_label)
+
+    min_size = min([len(d) for d in all_dfs])
+
+    all_dfs = [d.sample(n=min_size, random_state=42).reset_index(drop=True) for d in all_dfs]
+
+    new_min_size = min(min_size, 500)
+    if split == 'val':
+        new_min_size = min(min_size, 50)
+        print('Using smaller val size for faster eval:', new_min_size)
+    print('Using balanced dataset size of:', new_min_size)
+    all_dfs = [d.head(new_min_size) for d in all_dfs]
+
+
+    df_all = pd.concat(all_dfs)
+
+    neutral_data = read_de_neutral()
 
     if max_size:
         df = df.head(max_size)
-        df_no_gender = df_no_gender.head(max_size)
+        neutral_data = neutral_data.head(max_size)
+
+    if split == 'val':
+        neutral_data = neutral_data.head(50)
+
 
     dfs = {}
-        
-    model_analyser = DeEncoderAnalysis(config)
+    dfs_all = {}
+
     for model in models:
 
         output = get_file_name(model, max_size=max_size, file_format='csv', split=split)
-
-        if force or not os.path.isfile(output):
+        output_all = get_file_name(model, max_size=None, inverse=True, file_format='csv', split=split, variant='all')
+        if force or not (os.path.isfile(output) and os.path.isfile(output_all)):
             if ensemble: 
                 ae = CombinedEncoderDecoder.from_pretrained(model)
                 bert_with_ae = ModelWithGradiend.from_pretrained(model, ae=ae, ensemble=True)
@@ -1139,18 +1173,129 @@ def analyze_models(*models, config, max_size=None, force=True, split='test', pre
 
                 bert_with_ae = ModelWithGradiend.from_pretrained(model)
             model_analyser = DeEncoderAnalysis(config)
-            analyze_df = model_analyser.analyse_encoder(bert_with_ae,df,output=output, multi_task = multi_task)
+            analyze_df = model_analyser.analyse_encoder(bert_with_ae, df, output=output, multi_task=multi_task, neutral_data=neutral_data['text'])
+
+            config_all = config.copy()
+            config_all['articles'] = [art.lower() for art in df_all['label'].unique()]
+            config_all['default_predictions'] = ['most_likely_token', 'label'] + config_all['articles']
+
+            genders = ['M', 'F', 'N']
+            cases = ['N', 'A', 'D', 'G']
+            ctr = 0
+            df_all_augmented_data = []
+            combinations = []
+            for gender in genders:
+                other_genders = [g for g in genders if g != gender]
+                for case in cases:
+                    basic_key = case + gender
+                    basic_df = df_all[df_all['dataset_label'] == basic_key]
+                    other_cases = [c for c in cases if c != case]
+                    label = case_gender_mapping[case][gender]
+                    template_key = f'[{label.upper()}_ARTICLE]'
+                    for other_gender in other_genders:
+                        combination_key = f'{case}{gender}_g{other_gender}'
+                        combinations.append(combination_key)
+                        # todo delete if not needed and comment why this makes sense for this data
+
+                        inverse = case_gender_mapping[case][other_gender]
+                        if inverse == label:
+                            continue
+
+                        combination = {
+                            'mask': template_key,
+                            'inverse': inverse,
+                            'code': ctr,
+                            'encoding': 0, # todo?
+                        }
+                        with open_dict(config_all):
+                            config_all[combination_key] = combination
+
+                        g_basic_df = basic_df.copy()
+                        g_basic_df['dataset_label'] = combination_key
+                        g_basic_df['inverse'] = inverse
+                        df_all_augmented_data.append(g_basic_df)
+                        ctr += 1
+
+                    for other_case in other_cases:
+                        combination_key = f'{case}{gender}_c{other_case}'
+                        combinations.append(combination_key)
+
+                        inverse = case_gender_mapping[other_case][gender]
+                        if inverse == label:
+                            continue
+
+                        combination = {
+                            'mask': template_key,
+                            'inverse': inverse,
+                            'code': ctr,
+                            'encoding': 0, # todo?
+                        }
+                        with open_dict(config_all):
+                            config_all[combination_key] = combination
+                        c_basic_df = basic_df.copy()
+                        c_basic_df['dataset_label'] = combination_key
+                        c_basic_df['inverse'] = inverse
+                        df_all_augmented_data.append(c_basic_df)
+                        ctr += 1
+
+            config_all['combinations'] = combinations
+            model_analyser_all = DeEncoderAnalysis(config_all)
+            df_all_augmented = pd.concat(df_all_augmented_data).reset_index(drop=True)
+            output_all = get_file_name(model, max_size=None, file_format='csv', split=split, variant='all', inverse=True)
+            analyze_df_all_1 = model_analyser_all.analyse_encoder(bert_with_ae, df_all_augmented, output=output_all, multi_task=multi_task, full=True)
+
+            ctr = 0
+            df_all_augmented_data = []
+            combinations = []
+            for gender in genders:
+
+                for case in cases:
+                    basic_key = case + gender
+                    basic_df = df_all[df_all['dataset_label'] == basic_key]
+
+                    label = case_gender_mapping[case][gender]
+                    template_key = f'[{label.upper()}_ARTICLE]'
+
+                    combination_key = f'{case}{gender}'
+                    combinations.append(combination_key)
+                    # todo delete if not needed and comment why this makes sense for this data
+                    inverse = label
+
+                    combination = {
+                        'mask': template_key,
+                        'inverse': inverse,
+                        'code': ctr,
+                        'encoding': 0, # todo?
+                    }
+                    with open_dict(config_all):
+                        config_all[combination_key] = combination
+
+                    g_basic_df = basic_df.copy()
+                    g_basic_df['dataset_label'] = combination_key
+                    g_basic_df['inverse'] = inverse
+                    df_all_augmented_data.append(g_basic_df)
+                    ctr += 1
+
+            config_all['combinations'] = combinations
+            model_analyser_all = DeEncoderAnalysis(config_all)
+            df_all_augmented = pd.concat(df_all_augmented_data).reset_index(drop=True)
+            output_all = get_file_name(model, max_size=None, file_format='csv', split=split, variant='all', inverse=False)
+            analyze_df_all2 = model_analyser_all.analyse_encoder(bert_with_ae, df_all_augmented, output=output_all, multi_task=multi_task, full=True)
+            analyze_df_all = pd.concat([analyze_df_all_1, analyze_df_all2]).reset_index(drop=True)
+
             #analyze_df = analyze_model(bert_with_ae, df, names_df, output=output, df_no_gender=df_no_gender)
             print(f'Done with Model {model}')
 
         else:
             print(f'Skipping Model {model} as output file {output} already exists!')
             analyze_df = pd.read_csv(output)
+            analyze_df_all = pd.read_csv(output_all)
 
         if len(models) == 1:
-            return analyze_df
+            return analyze_df, analyze_df_all
         dfs[model] = analyze_df
-    return dfs
+        dfs_all[model] = analyze_df_all
+    return dfs, dfs_all
 
 
 def highlight_highest_values(data, headers):

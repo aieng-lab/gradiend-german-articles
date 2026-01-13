@@ -1,0 +1,17 @@
+name: gradiend
+metric: pearson
+model_config:
+  lr: 1e-4
+  epochs: 100
+  max_iterations: 5000
+  source: "inv_gradient"
+  multi_task: False
+  shared: False
+  eval_max_size: 500
+  n_evaluation: 1000
+  seed: 13
+  num_dims: 1
+  batch_size: 4
+  accumulation_steps: 1
+  torch_dtype: "bfloat16"
+  

@@ -355,6 +355,9 @@ def evaluate_mlm(model, tokenizer, text_data, file=None, verbose=True, batch_siz
                 predicted_token = tokenizer.decode([predicted_tokens_batch[mask_position]],
                                                    skip_special_tokens=True)
                 original_token = tokenizer.decode([original_tokens[mask_position]], skip_special_tokens=True)
+                if not original_token.strip():
+                    continue
+
                 correct = predicted_token.lower() == original_token.lower()
 
                 if correct:

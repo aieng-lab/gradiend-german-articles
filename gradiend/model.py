@@ -1,9 +1,13 @@
 import copy
 import re
 import warnings
+from collections import defaultdict
 
 import numpy as np
-from omegaconf import OmegaConf
+
+import torch
+from math import prod
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,9 +16,8 @@ from scipy.stats import binned_statistic
 from transformers import AutoModelForMaskedLM, AutoTokenizer, AutoModelForCausalLM
 import json
 import os
-import math
+from gradiend.util import hash_it, convert_tuple_keys_recursively
 
-from gradiend.util import hash_it
 HF_TOKEN = os.getenv('HF_TOKEN')
 
 
@@ -23,19 +26,24 @@ class AutoModelForLM(nn.Module):
     @classmethod
     def from_pretrained(self, name_or_path, torch_dtype=torch.float32):
         try:
-            return AutoModelForMaskedLM.from_pretrained(name_or_path)
+            model = AutoModelForMaskedLM.from_pretrained(name_or_path, trust_remote_code=True)
         except Exception:
-            if 'llama' in name_or_path.lower():
+            config_file = os.path.join(name_or_path, 'config_mlm_head.json')
+
+            if os.path.exists(config_file):
+                from gradiend.training.decoder_only_mlm.model import DecoderModelWithMLMHead
+                return DecoderModelWithMLMHead.from_pretrained(name_or_path, torch_dtype=torch_dtype)
+            elif 'llama' in name_or_path.lower():
                 return AutoModelForCausalLM.from_pretrained(name_or_path,
                                                             torch_dtype=torch_dtype,
                                                             token=HF_TOKEN,
-                                                            #device_map='auto',
                                                             )
+            model = AutoModelForCausalLM.from_pretrained(name_or_path)
 
-            return AutoModelForCausalLM.from_pretrained(name_or_path)
-
-
-
+        # set all requires_grad to True
+        for param in model.parameters():
+            param.requires_grad = True
+        return model
 
 class InstructTokenizerWrapper:
     system_prompt_mlm = """
@@ -214,7 +222,16 @@ Args:
         self.out_features = out_features
         self.in_chunk_size = in_chunk_size
         self.out_chunk_size = out_chunk_size
+        print('Dtype', dtype)
         self.linear = nn.Linear(in_features, out_features, bias=bias, dtype=dtype, device=device)
+
+    @property
+    def weight(self):
+        return self.linear.weight
+
+    @property
+    def bias(self):
+        return self.linear.bias
 
     def forward(self, input):
         if input.device != self.linear.weight.device:
@@ -304,18 +321,47 @@ Args:
         self.linear.bias = value  # Avoid re-registering
 
 
+def gradiend_dir(load_directory):
+    if not os.path.isdir(load_directory):
+        raise FileNotFoundError(f"{load_directory} is not a directory")
+
+    model_path = os.path.join(load_directory, 'pytorch_model.bin')
+    if os.path.exists(model_path):
+        return load_directory
+
+    # this might be a folder with multiple GRADIENDs from an experimental training with different seeds
+    # we pick the one with largest metrics.json value
+    candidate_dirs = [os.path.join(load_directory, d) for d in os.listdir(load_directory)
+                      if os.path.isdir(os.path.join(load_directory, d))]
+    candidate_metrics = {}
+    for cdir in candidate_dirs:
+        metrics_file_path = os.path.join(cdir, 'metrics.json')
+        if os.path.exists(metrics_file_path):
+            with open(metrics_file_path, 'r') as f:
+                metrics = json.load(f)
+            if isinstance(metrics, (int, float)):
+                candidate_metrics[cdir] = abs(metrics)
+    if not candidate_metrics:
+        raise FileNotFoundError(
+            f"No model found in {load_directory} and no candidate subdirectories with metrics.json")
+
+    best_dir = max(candidate_metrics, key=candidate_metrics.get)
+    return best_dir
+
+
+
 class GradiendModel(nn.Module):
     def __init__(self, input_dim,
+                 latent_dim,
                  layers,
                  activation='tanh',
-                 bias_decoder=False,
+                 bias_decoder=True,
                  decoder_factor=1.0,
-                 activation_decoder=None,
+                 activation_decoder='id',
                  torch_dtype=torch.float32,
                  device=None,
                  device_encoder=None,
                  device_decoder=None,
-                 latent_dim=1,
                  **kwargs):
         super(GradiendModel, self).__init__()
         self.device_encoder = device_encoder or device or torch.device('cuda')
@@ -323,6 +369,10 @@ class GradiendModel(nn.Module):
 
         self.latent_dim = int(latent_dim)
         self.input_dim = int(input_dim)
+
+        if self.input_dim <= 0 or self.latent_dim <= 0:
+            raise ValueError("Input and latent dimensions must be positive integers.")
+
         self.layers = layers
         self.activation = activation.lower()
         self.bias_decoder = bias_decoder
@@ -350,6 +400,7 @@ class GradiendModel(nn.Module):
         # Initialize the decoder weights with the same distribution as the encoder weights (up to decoder_factor)
         x = self.encoder[0].weight.max().item() * decoder_factor
         nn.init.uniform_(self.decoder[0].weight, -x, x)
+
         if bias_decoder:
             nn.init.uniform_(self.decoder[0].bias, -x, x)
 
@@ -376,7 +427,7 @@ class GradiendModel(nn.Module):
             layers_hash = hash_it(self.layers)
         return layers_hash
 
-    def extract_gradients(self, bert, return_dict=False, ):
+    def extract_gradients_(self, bert, return_dict=False, ):
         layer_map = {k: v for k, v in bert.named_parameters()}
         if isinstance(self.layers, dict):
             if return_dict:
@@ -389,11 +440,32 @@ class GradiendModel(nn.Module):
 
         return torch.concat([layer_map[layer].grad.flatten().detach() for layer in self.layers])
 
+    def extract_gradients(self, bert, return_dict=False):
+        layer_map = {k: v for k, v in bert.named_parameters()}
+        if isinstance(self.layers, dict):
+            if return_dict:
+                return {
+                    k: (v.grad.detach().clone() * self.layers[k]
+                        if v.grad is not None else torch.zeros_like(v))
+                    for k, v in layer_map.items() if k in self.layers
+                }
+            else:
+                layer_map = {
+                    k: v.grad[self.layers[k]].detach().clone()
+                    for k, v in layer_map.items() if k in self.layers
+                }
+                return torch.concat([layer_map[layer].flatten() for layer in self.layers])
+        elif return_dict:
+            return {layer: layer_map[layer].grad.detach().clone()
+                    for layer in self.layers}
+
+        return torch.concat([layer_map[layer].grad.flatten().detach().clone()
+                             for layer in self.layers])
+
     def set_tokenizer(self, tokenizer):
         self.tokenizer = tokenizer
 
     def forward(self, x, return_encoded=False):
-        from gradiend.combined_models.combined_gradiends import CombinedEncoderDecoder
         orig_shapes = {}
 
         if hasattr(x, 'named_parameters'):
@@ -430,16 +502,8 @@ class GradiendModel(nn.Module):
                     grads.append(grad)
                     orig_shapes[layer] = param.shape
             x = torch.concat(grads)
-        
-        # if isinstance(self, CombinedEncoderDecoder) and self.shared: 
-        if self.shared: 
-            latents = [enc(x) for enc in self.encoder]
-            encoded = torch.cat(latents, dim=0)
-            #encoded = self.encoder(x)
-        else: 
-            encoded = self.encoder(x)
 
-
+        encoded = self.encoder(x)
         if encoded.device != self.device_decoder:
             encoded = encoded.to(self.device_decoder)
         decoded = self.decoder(encoded)
@@ -514,18 +578,28 @@ class GradiendModel(nn.Module):
         if isinstance(self.layers, dict):
             config['layers_path'] = 'layers.pth'
 
-
         with open(config_path, 'w') as f:
             json.dump(config, f)
 
+
+
     def _serialize_kwargs(self):
         kwargs = self.kwargs.copy()
-        training_kwargs = kwargs['training'].copy()
+        if 'config' in kwargs['training']:
+            training_kwargs = kwargs['training']['config'].copy()
+        else:
+            # todo remove depracated use!
+            training_kwargs = kwargs['training']
 
         if isinstance(training_kwargs['layers'], dict):
             training_kwargs['layers'] = list(training_kwargs['layers'].keys())
             training_kwargs['layers_path'] = 'layers.pth'
-        kwargs['training'] = training_kwargs
+
+
+        if 'config' in kwargs['training']:
+            kwargs['training']['config'] = training_kwargs
+
+        kwargs = convert_tuple_keys_recursively(kwargs)
 
         return kwargs
 
@@ -553,29 +627,44 @@ class GradiendModel(nn.Module):
         return new_state_dict
 
     @classmethod
-    def from_pretrained(cls, load_directory, device_encoder=None, device_decoder=None):
+    def from_pretrained(cls, load_directory, device_encoder=None, device_decoder=None, device=None):
         model_path = os.path.join(load_directory, 'pytorch_model.bin')
+
+        if not os.path.exists(model_path):
+            best_dir = gradiend_dir(load_directory)
+            print(f"Loading model from best candidate directory: {best_dir}")
+            model_path = os.path.join(best_dir, 'pytorch_model.bin')
+            load_directory = best_dir
+
         config_path = os.path.join(load_directory, 'config.json')
 
         # Load model configuration
         with open(config_path, 'r') as f:
             config = json.load(f)
 
+        # check if the file actually belongs to a GRADIEND model
+        if 'input_dim' not in config or 'latent_dim' not in config or 'layers' not in config:
+            raise FileNotFoundError(f"The directory {load_directory} does not contain a valid GRADIEND model configuration.")
+
+        device_encoder = device_encoder or device
+        device_decoder = device_decoder or device
 
         if 'llama' in load_directory.lower() and device_encoder is None and device_decoder is None:
             # check that two GPUs are available
             if torch.cuda.device_count() < 2:
                 raise RuntimeError("Two GPUs are required for GRADIEND Llama models.")
 
-            device_encoder = torch.device("cuda:1")
-            device_decoder = torch.device("cuda:0")
+            device_encoder = torch.device("cuda:0")
+            device_decoder = torch.device("cuda:1")
 
         # Instantiate the model
         model = cls(**config, device_encoder=device_encoder, device_decoder=device_decoder)
 
-    # todo check GPU?
         # Load model state dictionary
-        state_dict = torch.load(model_path, map_location=device_decoder, weights_only=True)
+        try:
+            state_dict = torch.load(model_path, map_location=device_decoder, weights_only=True)
+        except Exception as e:
+            raise FileNotFoundError(f"Could not load model from {model_path}. Please ensure the file exists and is accessible.", e)
 
         # Check if the model is a legacy checkpoint
         if 'encoder.0.weight' in state_dict and 'decoder.0.weight' in state_dict:
@@ -653,14 +742,462 @@ class GradiendModel(nn.Module):
         plt.grid(True)
         plt.tight_layout()
 
-        return fig
+        return
+
+    @property
+    def source(self):
+        if 'config' in self.kwargs['training']:
+            source = self.kwargs['training']['config']['source']
+        else:
+            # todo deprecate
+            source = self.kwargs['training'].get('source', 'factual')
+
+        if source == 'gradient':
+            source = 'factual'
+        elif source == 'inv_gradient':
+            source = 'counterfactual'
+
+        return source
+
+
+    def __add__(self, other):
+        if not isinstance(other, GradiendModel):
+            raise ValueError("Can only add GradiendModel instances together.")
+
+        # ensure both models have the same architecture
+        if self.input_dim != other.input_dim or self.latent_dim != other.latent_dim:
+            raise ValueError("Both GradiendModel instances must have the same input and latent dimensions.")
+
+        new_model = copy.deepcopy(self)
+        # Add encoder weights
+        new_model.encoder[0].weight.data += other.encoder[0].weight.data
+        if self.encoder[0].bias is not None and other.encoder[0].bias is not None:
+            new_model.encoder[0].bias.data += other.encoder[0].bias.data
+        # Add decoder weights
+        new_model.decoder[0].weight.data += other.decoder[0].weight.data
+        if self.decoder[0].bias is not None and other.decoder[0].bias is not None:
+            new_model.decoder[0].bias.data += other.decoder[0].bias.data
+        return new_model
+
+    def __sub__(self, other):
+        if not isinstance(other, GradiendModel):
+            raise ValueError("Can only add GradiendModel instances together.")
+
+        # ensure both models have the same architecture
+        if self.input_dim != other.input_dim or self.latent_dim != other.latent_dim:
+            raise ValueError("Both GradiendModel instances must have the same input and latent dimensions.")
+
+        new_model = copy.deepcopy(self)
+        # Add encoder weights
+        new_model.encoder[0].weight.data -= other.encoder[0].weight.data
+        if self.encoder[0].bias is not None and other.encoder[0].bias is not None:
+            new_model.encoder[0].bias.data -= other.encoder[0].bias.data
+        # Add decoder weights
+        new_model.decoder[0].weight.data -= other.decoder[0].weight.data
+        if self.decoder[0].bias is not None and other.decoder[0].bias is not None:
+            new_model.decoder[0].bias.data -= other.decoder[0].bias.data
+        return new_model
+
+
+    def normalize(self):
+        import copy
+        new_model = copy.deepcopy(self)
+
+        # Normalize encoder
+        w = new_model.encoder[0].weight.data
+        norm = w.norm(p=2)
+        if norm > 0:
+            new_model.encoder[0].weight.data = w / norm
+
+        if new_model.encoder[0].bias is not None:
+            b = new_model.encoder[0].bias.data
+            norm_b = b.norm(p=2)
+            if norm_b > 0:
+                new_model.encoder[0].bias.data = b / norm_b
+
+        # Normalize decoder
+        w = new_model.decoder[0].weight.data
+        norm = w.norm(p=2)
+        if norm > 0:
+            new_model.decoder[0].weight.data = w / norm
+
+        if new_model.decoder[0].bias is not None:
+            b = new_model.decoder[0].bias.data
+            norm_b = b.norm(p=2)
+            if norm_b > 0:
+                new_model.decoder[0].bias.data = b / norm_b
+
+        return new_model
+
+
+    def get_top_k_weights(self,
+                          *,
+                          part='decoder',
+                          top_k=100,
+                          scope='neuron',  # 'weight' or 'neuron'
+                          scope_direction='outgoing',
+                          # 'outgoing' or 'incoming' (meaningful for 'neuron' or mapping weights->neurons)
+                          return_sorted=True,
+                          return_format='list',  # 'list' | 'by_param' | 'idx_to_param'
+                          map_to_neuron=False  # only valid when scope == 'weight'
+                          ):
+        """
+        Return top-k items from the specified part.
+
+        Args:
+            part: 'encoder' | 'decoder' | 'decoder_bias'
+            top_k: number of top items to return
+            scope: 'weight' (return top weight indices) or 'neuron' (return top neurons by aggregated weight importance)
+            scope_direction: for neuron aggregation / mapping - 'outgoing' (output neurons / rows) or 'incoming' (input neurons / cols)
+            return_format: 'list' (default) -> list of indices,
+                           'by_param' -> dict param_name -> list,
+                           'idx_to_param' -> dict index -> param_name
+            map_to_neuron: if True and scope=='weight', also return mapping from weight index -> neuron index (ingoing/outgoing)
+
+        Returns:
+            Depending on return_format and map_to_neuron:
+              - list of indices (default)
+              - dicts as described above
+              - if map_to_neuron True and return_format == 'list': returns tuple (indices_list, mapping_dict)
+        """
+        import numpy as np
+        import torch
+
+        assert scope in ['weight', 'neuron'], "scope must be 'weight' or 'neuron'"
+        assert scope_direction in ['outgoing', 'incoming'], "scope_direction must be 'outgoing' or 'incoming'"
+        assert return_format in ['list', 'by_param',
+                                 'idx_to_param'], "return_format must be 'list','by_param' or 'idx_to_param'"
+
+        if scope == 'neuron':
+            raise ValueError('Use ModelWithGradiend.get_top_k_neurons for neuron-level importance.')
+
+
+        # choose the correct parameter tensor
+        if part == 'encoder':
+            param = self.encoder[0].weight
+            param_name = 'encoder.0.weight'
+            bias = getattr(self.encoder[0], 'bias', None)
+        elif part == 'decoder':
+            param = self.decoder[0].weight
+            param_name = 'decoder.0.weight'
+            bias = getattr(self.decoder[0], 'bias', None)
+        elif part == 'decoder_bias':
+            # treat biases as a separate 1D tensor
+            param = self.decoder[0].bias
+            param_name = 'decoder.0.bias'
+            bias = None
+        else:
+            raise ValueError("part must be 'encoder', 'decoder', or 'decoder_bias'")
+
+
+        if param is None:
+            # nothing to do
+            if return_format == 'list':
+                return []
+            elif return_format == 'by_param':
+                return {param_name: []}
+            else:
+                return {}
+
+        w = param.data.squeeze().cpu()
+
+        # compute importance according to scope
+        if scope == 'weight':
+            # flatten absolute weights
+            importance = w.abs().flatten()
+        else:  # scope == 'neuron'
+            # For 2D weight matrix (out_features, in_features):
+            if w.dim() == 2:
+                if scope_direction == 'outgoing':
+                    # each output neuron is a row -> sum abs across in_features
+                    importance = w.abs().sum(dim=1)
+                else:
+                    # incoming: each input neuron is a column -> sum abs across out_features
+                    importance = w.abs().sum(dim=0)
+            elif w.dim() == 1:
+                # bias: neuron-level already
+                importance = w.abs()
+            else:
+                # fallback: flatten
+                importance = w.abs().flatten()
+
+        # clamp top_k
+        k = min(int(top_k), int(importance.numel()))
+        if k == 0:
+            if return_format == 'list':
+                return []
+            elif return_format == 'by_param':
+                return {param_name: []}
+            else:
+                return {}
+
+        # topk (on CPU tensors)
+        vals, top_idx = torch.topk(importance, k=k, largest=True, sorted=return_sorted)
+        top_idx_list = top_idx.cpu().numpy().tolist()
+
+        # optional mapping: weight index -> neuron index
+        neuron_map = None
+        if map_to_neuron and scope == 'weight':
+            # Need the original weight shape to map flattened weight index -> (out_idx, in_idx)
+            if w.dim() == 2:
+                out_dim, in_dim = w.shape
+                # unravel top indices to (out, in)
+                idx_arr = np.array(top_idx.cpu().numpy(), dtype=np.int64)
+                out_idx, in_idx = np.unravel_index(idx_arr, (out_dim, in_dim))
+                if scope_direction == 'outgoing':
+                    mapped = out_idx.tolist()
+                else:
+                    mapped = in_idx.tolist()
+                neuron_map = dict(zip(top_idx_list, mapped))
+            elif w.dim() == 1:
+                # flattened weights is same as neurons for 1D (bias) -> map to that index
+                neuron_map = {int(i): int(i) for i in top_idx_list}
+            else:
+                # unknown shape: return None mapping
+                neuron_map = {int(i): None for i in top_idx_list}
+
+        # assemble return according to requested format
+        if return_format == 'list':
+            if map_to_neuron and scope == 'weight':
+                return top_idx_list, neuron_map
+            return top_idx_list
+
+        elif return_format == 'by_param':
+            # currently we only support a single param (encoder.0.weight / decoder.0.weight / decoder.0.bias)
+            if map_to_neuron and scope == 'weight':
+                return {param_name: {'top_indices': top_idx_list, 'neuron_map': neuron_map}}
+            return {param_name: top_idx_list}
+
+        else:  # 'idx_to_param'
+            # map each returned (flat) index -> param name
+            if map_to_neuron and scope == 'weight':
+                return {int(idx): {'param': param_name, 'neuron': neuron_map[int(idx)]} for idx in top_idx_list}
+            return {int(idx): param_name for idx in top_idx_list}
+
+
+
+    def _get_top_k_neurons(
+            self,
+            model: torch.nn.Module,
+            weight_scores: torch.Tensor,  # flattened
+            k: int,
+            direction="outgoing",
+    ):
+        """
+        Returns:
+            weight_to_neuron: dict[int -> neuron_id]
+            neuron_to_all_weights: dict[neuron_id -> list[int]]
+        """
+
+        assert direction in {"outgoing", "ingoing"}
+
+        topk_indices = torch.topk(weight_scores.abs(), k).indices.tolist()
+        topk_set = set(topk_indices)
+
+        weight_to_neuron = {}
+        neuron_to_all_weights = {}
+
+        config = model.config
+        running_idx = 0
+
+        for name, param in model.named_parameters():
+            if self.layers and name not in self.layers:
+                continue
+
+
+            if param.dim() < 2:
+                running_idx += param.numel()
+                continue
+
+            rows, cols = param.shape
+            numel = param.numel()
+            param_range = range(running_idx, running_idx + numel)
+
+            overlap = topk_set.intersection(param_range)
+            if not overlap:
+                running_idx += numel
+                continue
+
+            local_topk = [i - running_idx for i in overlap]
+            lname = name.lower()
+
+            # ============================================================
+            # GPT-2: fused QKV (attn.c_attn)
+            # ============================================================
+            if "attn.c_attn" in lname:
+                hidden = rows
+                num_heads = config.n_head
+                dk = hidden // num_heads
+
+                cols_hit = {idx % cols for idx in local_topk}
+
+                for c in cols_hit:
+                    block = c // hidden  # 0=Q,1=K,2=V
+                    inner = c % hidden
+                    head = inner // dk
+                    j = inner % dk
+                    role = ["q", "k", "v"][block]
+
+                    neuron = ("attention", name, role, head, j)
+
+                    # top-k → neuron
+                    for r in range(rows):
+                        widx = running_idx + r * cols + c
+                        if widx in overlap:
+                            weight_to_neuron[widx] = neuron
+
+                    # ALL weights
+                    all_w = [
+                        running_idx + r * cols + c
+                        for r in range(rows)
+                    ]
+                    neuron_to_all_weights.setdefault(neuron, all_w)
+
+            # ============================================================
+            # LLaMA: q_proj / k_proj / v_proj (GQA-safe)
+            # ============================================================
+            elif any(x in lname for x in [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj"
+            ]):
+                hidden = config.hidden_size
+                num_heads = config.num_attention_heads
+                dk = hidden // num_heads
+
+                if "q_proj" in lname:
+                    role = "q"
+                elif "k_proj" in lname:
+                    role = "k"
+                else:
+                    role = "v"
+
+                cols_hit = {idx % cols for idx in local_topk}
+
+                for c in cols_hit:
+                    head = c // dk
+                    j = c % dk
+                    neuron = ("attention", name, role, head, j)
+
+                    for r in range(rows):
+                        widx = running_idx + r * cols + c
+                        if widx in overlap:
+                            weight_to_neuron[widx] = neuron
+
+                    all_w = [
+                        running_idx + r * cols + c
+                        for r in range(rows)
+                    ]
+                    neuron_to_all_weights.setdefault(neuron, all_w)
+
+            # ============================================================
+            # BERT-style attention (query / key / value)
+            # ============================================================
+            elif any(x in lname for x in ["query", "key", "value"]):
+                base = name.replace(".weight", "").replace(".bias", "")
+                base = base.rsplit(".", 1)[0]
+
+                num_heads = config.num_attention_heads
+                dk = cols // num_heads
+
+                if "query" in lname:
+                    role = "q"
+                elif "key" in lname:
+                    role = "k"
+                else:
+                    role = "v"
+
+                cols_hit = {idx % cols for idx in local_topk}
+
+                for c in cols_hit:
+                    head = c // dk
+                    j = c % dk
+                    neuron = ("attention", base, head, j)
+
+                    for r in range(rows):
+                        widx = running_idx + r * cols + c
+                        if widx in overlap:
+                            weight_to_neuron[widx] = neuron
+
+                    all_w = [
+                        running_idx + r * cols + c
+                        for r in range(rows)
+                    ]
+                    neuron_to_all_weights.setdefault(neuron, all_w)
+
+            # ============================================================
+            # LLaMA MLP (SwiGLU: gate / up / down)
+            # ============================================================
+            elif any(x in lname for x in ["gate_proj", "up_proj", "down_proj"]):
+                rows_hit = {idx // cols for idx in local_topk}
+                for r in rows_hit:
+                    neuron = ("mlp", name, r)
+
+                    for c in range(cols):
+                        widx = running_idx + r * cols + c
+                        if widx in overlap:
+                            weight_to_neuron[widx] = neuron
+
+                    all_w = [
+                        running_idx + r * cols + c
+                        for c in range(cols)
+                    ]
+                    neuron_to_all_weights.setdefault(neuron, all_w)
+
+            # ============================================================
+            # Standard MLP (BERT / GPT-2)
+            # ============================================================
+            else:
+                if direction == "outgoing":
+                    rows_hit = {idx // cols for idx in local_topk}
+                    for r in rows_hit:
+                        neuron = ("mlp", name, r)
+
+                        for c in range(cols):
+                            widx = running_idx + r * cols + c
+                            if widx in overlap:
+                                weight_to_neuron[widx] = neuron
+
+                        all_w = [
+                            running_idx + r * cols + c
+                            for c in range(cols)
+                        ]
+                        neuron_to_all_weights.setdefault(neuron, all_w)
+
+                else:  # ingoing
+                    cols_hit = {idx % cols for idx in local_topk}
+                    for c in cols_hit:
+                        neuron = ("mlp", name, c)
+
+                        for r in range(rows):
+                            widx = running_idx + r * cols + c
+                            if widx in overlap:
+                                weight_to_neuron[widx] = neuron
+
+                        all_w = [
+                            running_idx + r * cols + c
+                            for r in range(rows)
+                        ]
+                        neuron_to_all_weights.setdefault(neuron, all_w)
+
+            running_idx += numel
+
+        return weight_to_neuron, neuron_to_all_weights
+
+
+    def __len__(self):
+        return self.encoder[0].in_features
+
 
 def is_generative(model):
-    return hasattr(model, 'lm_head')
+    return hasattr(model, 'lm_head') or 'llama' in model.__class__.__name__.lower()
+
+
+
 
 class ModelWithGradiend(nn.Module):
 
-    def __init__(self, base_model, gradiend, tokenizer, base_model_device=None):
+    def __init__(self, base_model, gradiend, tokenizer, base_model_device=None, torch_dtype=None):
   
         super().__init__()
         self.base_model = base_model
@@ -668,8 +1205,12 @@ class ModelWithGradiend(nn.Module):
         self.tokenizer = tokenizer
         self.grad_iterations = gradiend.grad_iterations
 
-        self.base_model_device = base_model_device or torch.device('cuda') # todo cuda:1
+        self.base_model_device = base_model_device or gradiend.encoder[0].linear.weight.device
         self.base_model.to(self.base_model_device)
+        if torch_dtype:
+            self.base_model = self.base_model.to(torch_dtype)
+            self.gradiend = self.gradiend.to(torch_dtype)
+
         self.layer_map = {k: v for k, v in self.base_model.named_parameters()}
 
         self.is_instruction_model = isinstance(self.tokenizer, InstructTokenizerWrapper)
@@ -733,7 +1274,12 @@ class ModelWithGradiend(nn.Module):
 
 
 
-    def modify_model(self, lr, gender_factor, part='decoder', top_k=None, top_k_part=None):
+    def transform_weights_to_neurons(self):
+        raise NotImplementedError()
+
+
+
+    def modify_model(self, lr, feature_factor, part='decoder',  top_k=None, top_k_part=None, additive=True):
         from gradiend.combined_models.combined_gradiends import StackedGradiend, CombinedEncoderDecoder
         # returns a base_model model with enhanced weights based on the auto encoder, use the learning rate parameter to control the influence of the auto encoder
         top_k_part = top_k_part or part
@@ -748,12 +1294,12 @@ class ModelWithGradiend(nn.Module):
         layer_map = {k: v for k, v in enhanced_model.named_parameters()}
         if part == 'decoder':
             if isinstance(self.gradiend, StackedGradiend):
-                enhancer1, enhancer2, enhancer3 = self.gradiend.modify_model_decode_v1(gender_factor)
-            elif isinstance(self.gradiend, CombinedEncoderDecoder): 
-                enhancer = self.gradiend.modified_decode(x = gender_factor, method='sum')
+                enhancer1, enhancer2, enhancer3 = self.gradiend.modify_model_decode_v1(feature_factor)
+            elif isinstance(self.gradiend, CombinedEncoderDecoder):
+                enhancer = self.gradiend.modified_decode(x = feature_factor, method='sum')
             else:
-                enhancer = self.gradiend.decoder(torch.tensor([gender_factor], dtype=torch.float, device=model_device))
-                print('length of the enhance', len(enhancer))
+                decoder_dtype = self.gradiend.decoder[0].weight.dtype
+                enhancer = self.gradiend.decoder(torch.tensor([feature_factor], dtype=decoder_dtype, device=model_device))
         elif part == 'encoder':
             enhancer = self.gradiend.encoder[0].weight.flatten().to(model_device)
         else:
@@ -781,7 +1327,10 @@ class ModelWithGradiend(nn.Module):
                     update_tensor[layer_mask] = update_values  # Assign values only to True positions
 
                     # Apply update
-                    layer_map[layer] += lr * update_tensor
+                    if additive:
+                        layer_map[layer] += lr * update_tensor
+                    else: # todo
+                        layer_map[layer] = lr * torch.ones_like(update_tensor)
 
                     # Increment index
                     idx += number_of_elements
@@ -796,8 +1345,150 @@ class ModelWithGradiend(nn.Module):
                         layer_chunk = torch.mean(torch.stack([layer_chunk_1, layer_chunk_2, layer_chunk_3]), dim=0)
                     else:   
                         layer_chunk = enhancer[idx:idx + number_of_elements].to(model_device)
-                    layer_map[layer] += lr * layer_chunk.reshape(shape)
+                    if additive:
+                        layer_map[layer] += lr * layer_chunk.reshape(shape)
+                    else:
+
+                        layer_map[layer] = lr * torch.ones_like(layer_chunk) # todo
                     idx += number_of_elements
+
+        return enhanced_model
+
+    def modify_model(self, lr, feature_factor, part="decoder", top_k=None, top_k_part=None, additive=True):
+        import copy
+        import torch
+        from gradiend.combined_models.combined_gradiends import StackedGradiend, CombinedEncoderDecoder
+
+        top_k_part = top_k_part or part
+        enhanced_model = copy.deepcopy(self.base_model)
+
+        if top_k == 0:
+            return enhanced_model
+
+        def _first_param_device_dtype(m):
+            p = next(m.parameters(), None)
+            if p is None:
+                return torch.device("cpu"), torch.float32
+            return p.device, p.dtype
+
+        def _as_like_scalar(x, *, device, dtype):
+            # robust for python floats/ints, numpy scalars, tensors
+            return torch.as_tensor(x, device=device, dtype=dtype)
+
+        def _cast_to_param(t, param, *, flatten=False):
+            t = t.to(device=param.device, dtype=param.dtype, non_blocking=True)
+            return t.flatten() if flatten else t
+
+        # --- build enhancer on the enhancer's own device/dtype (NOT the base model's) ---
+        if part == "decoder":
+            if isinstance(self.gradiend, StackedGradiend):
+                enhancer1, enhancer2, enhancer3 = self.gradiend.modify_model_decode_v1(feature_factor)
+            elif isinstance(self.gradiend, CombinedEncoderDecoder):
+                enhancer = self.gradiend.modified_decode(x=feature_factor, method="sum")
+            else:
+                dec = self.gradiend.decoder
+                enh_dev, enh_dtype = _first_param_device_dtype(dec)
+                ff = _as_like_scalar([feature_factor], device=enh_dev, dtype=enh_dtype)
+                enhancer = dec(ff)
+        elif part == "encoder":
+            enc = self.gradiend.encoder
+            enh_dev, enh_dtype = _first_param_device_dtype(enc)
+            # keep on enhancer device for now; cast per-layer later
+            enhancer = enc[0].weight.detach().flatten().to(device=enh_dev)
+        else:
+            raise ValueError(f"Unsupported part: {part}")
+
+        # --- top-k masking (works for both stacked and single enhancer) ---
+        if top_k is not None:
+            if isinstance(self.gradiend, StackedGradiend):
+                enh_len = len(enhancer1)
+            else:
+                enh_len = len(enhancer)
+
+            if top_k < enh_len:
+                mask = self.get_enhancer_mask(top_k, part=top_k_part)
+                if not torch.is_tensor(mask):
+                    mask = torch.as_tensor(mask)
+                mask = mask.to(dtype=torch.bool)
+
+                if mask.sum().item() == 0:
+                    return enhanced_model
+
+                if isinstance(self.gradiend, StackedGradiend):
+                    # ensure mask sits on the right device for each tensor
+                    enhancer1 = enhancer1.clone()
+                    enhancer2 = enhancer2.clone()
+                    enhancer3 = enhancer3.clone()
+                    enhancer1[~mask.to(enhancer1.device)] = 0.0
+                    enhancer2[~mask.to(enhancer2.device)] = 0.0
+                    enhancer3[~mask.to(enhancer3.device)] = 0.0
+                else:
+                    enhancer = enhancer.clone()
+                    enhancer[~mask.to(enhancer.device)] = 0.0
+
+        # --- apply updates per-parameter on THAT parameter's device/dtype ---
+        layer_map = dict(enhanced_model.named_parameters())
+        idx = 0
+
+        with torch.no_grad():
+            if isinstance(self.gradiend.layers, dict):
+                # layers: {param_name: boolean_mask_tensor_same_shape_as_param}
+                for layer_name, layer_mask in self.gradiend.layers.items():
+                    param = layer_map[layer_name]
+                    m = layer_mask
+                    if not torch.is_tensor(m):
+                        m = torch.as_tensor(m)
+                    m = m.to(device=param.device, dtype=torch.bool)
+
+                    n = int(m.sum().item())
+                    if isinstance(self.gradiend, StackedGradiend):
+                        raise ValueError("Dict-style layers with StackedGradiend not supported in current code path.")
+                    if idx + n > len(enhancer):
+                        raise ValueError("Enhancer vector shorter than required parameter updates.")
+
+                    upd_vals = _cast_to_param(enhancer[idx: idx + n], param, flatten=True)
+
+                    # fill masked positions robustly regardless of mask shape
+                    upd = torch.zeros_like(param, dtype=param.dtype, device=param.device)
+                    upd_flat = upd.view(-1)
+                    m_flat = m.view(-1)
+                    upd_flat[m_flat] = upd_vals
+                    upd = upd_flat.view_as(param)
+
+                    if additive:
+                        param.data.add_(upd, alpha=lr)
+                    else:
+                        param.data.copy_(torch.ones_like(param) * lr)
+
+                    idx += n
+            else:
+                # layers: list of param_names; enhancer is flat chunk per param.numel()
+                for layer_name in self.gradiend.layers:
+                    param = layer_map[layer_name]
+                    n = param.numel()
+
+                    if isinstance(self.gradiend, StackedGradiend):
+                        if idx + n > len(enhancer1):
+                            raise ValueError("Enhancer vector shorter than required parameter updates.")
+                        c1 = _cast_to_param(enhancer1[idx: idx + n], param, flatten=True)
+                        c2 = _cast_to_param(enhancer2[idx: idx + n], param, flatten=True)
+                        c3 = _cast_to_param(enhancer3[idx: idx + n], param, flatten=True)
+
+                        # mean in fp32 for stability, then cast back to param dtype
+                        chunk = torch.stack([c1.float(), c2.float(), c3.float()], dim=0).mean(dim=0).to(param.dtype)
+                    else:
+                        if idx + n > len(enhancer):
+                            raise ValueError("Enhancer vector shorter than required parameter updates.")
+                        chunk = _cast_to_param(enhancer[idx: idx + n], param, flatten=True)
+
+                    chunk = chunk.view_as(param)
+
+                    if additive:
+                        param.data.add_(chunk, alpha=lr)
+                    else:
+                        param.data.copy_(torch.ones_like(param) * lr)
+
+                    idx += n
 
         return enhanced_model
 
@@ -925,6 +1616,8 @@ class ModelWithGradiend(nn.Module):
         loss_bert = outputs.loss
 
         self.base_model.zero_grad()
+        if loss_bert is None:
+            return None
         loss_bert.backward()
 
         gradients = self.gradiend.extract_gradients(self.base_model)
@@ -932,7 +1625,7 @@ class ModelWithGradiend(nn.Module):
         if shared: 
             encoded = self.gradiend.encode(gradients, shared=False).detach().cpu().numpy()
         else:
-            encoded = self.gradiend.encoder(gradients).detach().cpu().numpy()
+            encoded = self.gradiend.encoder(gradients).to(torch.float32).detach().cpu().numpy()
 
         if return_masked_text:
             masked_str = self.tokenizer.decode(item['input_ids'].squeeze())
@@ -966,7 +1659,7 @@ class ModelWithGradiend(nn.Module):
             item['labels'] = labels
         return item
 
-    def forward_pass(self, inputs, return_dict=False, lr=1e-4, verbose=True): # todo implement batched=True
+    def forward_pass(self, inputs, return_dict=False, lr=1e-4, verbose=False): # todo implement batched=True
 
         inputs = {k: v.to(self.base_model_device) for k, v in inputs.items()}
 
@@ -977,7 +1670,11 @@ class ModelWithGradiend(nn.Module):
             for i in range(self.grad_iterations):
                 outputs = base_model(**inputs)
                 loss_bert = outputs.loss
+
                 base_model.zero_grad()
+
+                if loss_bert is None:
+                    return None
                 loss_bert.backward()
                 gradients = self.gradiend.extract_gradients(base_model, return_dict=True)
                 grads.append(gradients)
@@ -1023,6 +1720,8 @@ class ModelWithGradiend(nn.Module):
                 #print('Next Tokens', next_tokens)
 
             loss_bert = outputs.loss
+            if loss_bert is None:
+                return None
 
             self.base_model.zero_grad()
             loss_bert.backward()
@@ -1032,6 +1731,9 @@ class ModelWithGradiend(nn.Module):
     @property
     def layers_hash(self):
         return self.gradiend.layers_hash
+
+    def __len__(self):
+        return len(self.gradiend)
 
     # invert the encoded value, i.e. encoded value * (-1), while keeping the decoders value
     def invert_encoding(self):
@@ -1044,8 +1746,7 @@ class ModelWithGradiend(nn.Module):
         self.gradiend.save_pretrained(save_directory, bert=self.base_model.name_or_path, tokenizer=self.tokenizer.name_or_path, **kwargs)
 
     @classmethod
-    def from_pretrained(cls, load_directory, ae=None, layers=None, latent_dim=1, torch_dtype=torch.float32, ensemble=False, device=None, **kwargs):
-        from gradiend.combined_models.combined_gradiends import  CombinedEncoderDecoder
+    def from_pretrained(cls, load_directory, ae=None, layers=None, latent_dim=1, torch_dtype=torch.float32, ensemble=False, device=None, device_decoder=None, **kwargs):
         layers = layers or []
         if len(layers) == 1 and isinstance(layers[0], list):
             layers = layers[0]
@@ -1053,19 +1754,28 @@ class ModelWithGradiend(nn.Module):
         device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         device_encoder = device
         device_decoder = device
-        if 'llama' in load_directory.lower():
+        device_base_model = device
+        if 'llama' in load_directory.lower() and device != torch.device("cpu"):
             # check that two GPUs are available
-            if torch.cuda.device_count() < 2:
+            cuda_count = torch.cuda.device_count()
+            if cuda_count < 2:
                 raise RuntimeError("Two GPUs are required for GRADIEND Llama models.")
 
-            device_encoder = torch.device("cuda:1")
-            device_decoder = torch.device("cuda:0")
+            device_encoder = torch.device("cuda:0")
+            device_decoder = torch.device("cuda:1")
+            available_gpu_ram = torch.cuda.get_device_properties(device_encoder).total_memory // (1024 ** 3)
+            available_gpu_ram_greater_than_100GB = available_gpu_ram >= 100
+            device_base_model = device_encoder if (cuda_count == 2 or available_gpu_ram_greater_than_100GB) else torch.device("cuda:2")
+            print(f'Using device_encoder: {device_encoder}, device_decoder: {device_decoder}, device_base_model: {device_base_model}')
+            torch_dtype=torch.bfloat16
+
+        if '1B' in load_directory.lower():
+            torch_dtype = torch.bfloat16
 
         try:
             if not ensemble: 
                 ae = GradiendModel.from_pretrained(load_directory, device_encoder=device_encoder, device_decoder=device_decoder)
 
-          
             if layers and ae.layers != layers:
                 raise ValueError(f'The provided layers {layers} do not match the layers in the model configuration {ae.layers}')
             else:
@@ -1078,19 +1788,19 @@ class ModelWithGradiend(nn.Module):
                 base_model_id = ae.kwargs['base_model']
                 tokenizer = ae.kwargs.get('tokenizer', base_model_id)
 
-            base_model = AutoModelForLM.from_pretrained(base_model_id)
+            base_model = AutoModelForLM.from_pretrained(base_model_id, torch_dtype=torch_dtype).to(device_base_model)
             tokenizer = AutoTokenizerForLM.from_pretrained(tokenizer)
         except FileNotFoundError:
             print('No model with auto encoder found in the specified directory:', load_directory, ' -> creating a new auto encoder')
 
             if isinstance(load_directory, str):
-                base_model = AutoModelForLM.from_pretrained(load_directory, torch_dtype=torch_dtype)
+                base_model = AutoModelForLM.from_pretrained(load_directory, torch_dtype=torch_dtype).to(device_base_model)
                 tokenizer = AutoTokenizerForLM.from_pretrained(load_directory)
             else:
                 base_model = load_directory
                 tokenizer = base_model.tokenizer
 
-            layer_map = {k: v for k, v in base_model.named_parameters() if 'cls.prediction' not in k.lower()}
+            layer_map = {k: v for k, v in base_model.named_parameters() if 'cls.prediction' not in k.lower() and 'lm_head' not in k.lower()}
 
             if layers:
                 if not isinstance(layers, dict):
@@ -1124,13 +1834,14 @@ class ModelWithGradiend(nn.Module):
                                latent_dim=latent_dim,
                                base_model=load_directory,
                                torch_dtype=torch_dtype,
-                               device=device,
+                               device_encoder=device_encoder,
+                               device_decoder=device_decoder,
                                **kwargs)
 
         # freeze all layers that do not require gradient calculations
         freeze_layers_until_target(base_model, *layers)
 
-        model = ModelWithGradiend(base_model, ae, tokenizer)
+        model = ModelWithGradiend(base_model, ae, tokenizer, base_model_device=device_base_model, torch_dtype=torch_dtype)
         model.name_or_path = load_directory
         return model
 
@@ -1163,6 +1874,105 @@ class ModelWithGradiend(nn.Module):
         if idx != weights.numel():
             raise ValueError(f'Inconsistent number of elements in the weights and expected number of elements in the layers ({idx} vs. {weights.numel()})')
 
+
+    def get_top_k_neurons(self,
+                          *,
+                          part='decoder',
+                          top_k=100,
+                          scope='neuron',  # 'weight' or 'neuron'
+                          scope_direction='outgoing',
+                          # 'outgoing' or 'incoming' (meaningful for 'neuron' or mapping weights->neurons)
+                          return_sorted=True,
+                          return_format='list',  # 'list' | 'by_param' | 'idx_to_param'
+                          map_to_neuron=False,  # only valid when scope == 'weight'
+                          return_weight_indices=False, # when scope == 'neuron', return the weight indices that correspond to the top neurons
+                          ):
+        """
+        Return top-k items from the specified part.
+
+        Args:
+            part: 'encoder' | 'decoder' | 'decoder_bias'
+            top_k: number of top items to return
+            scope: 'weight' (return top weight indices) or 'neuron' (return top neurons by aggregated weight importance)
+            scope_direction: for neuron aggregation / mapping - 'outgoing' (output neurons / rows) or 'incoming' (input neurons / cols)
+            return_format: 'list' (default) -> list of indices,
+                           'by_param' -> dict param_name -> list,
+                           'idx_to_param' -> dict index -> param_name
+            map_to_neuron: if True and scope=='weight', also return mapping from weight index -> neuron index (ingoing/outgoing)
+
+        Returns:
+            Depending on return_format and map_to_neuron:
+              - list of indices (default)
+              - dicts as described above
+              - if map_to_neuron True and return_format == 'list': returns tuple (indices_list, mapping_dict)
+        """
+        import numpy as np
+        import torch
+
+        assert scope in ['weight', 'neuron'], "scope must be 'weight' or 'neuron'"
+        assert scope_direction in ['outgoing', 'incoming'], "scope_direction must be 'outgoing' or 'incoming'"
+        assert return_format in ['list', 'by_param',
+                                 'idx_to_param'], "return_format must be 'list','by_param' or 'idx_to_param'"
+
+        # choose the correct parameter tensor
+        if part == 'encoder':
+            param = self.gradiend.encoder[0].weight
+            param_name = 'encoder.0.weight'
+            bias = getattr(self.gradiend.encoder[0], 'bias', None)
+        elif part == 'decoder':
+            param = self.gradiend.decoder[0].weight
+            param_name = 'decoder.0.weight'
+            bias = getattr(self.gradiend.decoder[0], 'bias', None)
+        elif part == 'decoder_bias':
+            # treat biases as a separate 1D tensor
+            param = self.gradiend.decoder[0].bias
+            param_name = 'decoder.0.bias'
+            bias = None
+        else:
+            raise ValueError("part must be 'encoder', 'decoder', or 'decoder_bias'")
+
+
+        if param is None:
+            # nothing to do
+            if return_format == 'list':
+                return []
+            elif return_format == 'by_param':
+                return {param_name: []}
+            else:
+                return {}
+
+        w = param.data.squeeze().cpu()
+
+
+
+
+        if scope == 'neuron':
+            # weight_to_neuron: dict(weight_idx -> neuron_identifier)
+            # neuron_hit_count: dict(neuron_identifier -> count)
+            weight_to_neuron, neuron_to_all_weights  = self.gradiend._get_top_k_neurons(
+                self.base_model, w, top_k, scope_direction
+            )
+
+            # collect all neurons touched
+            affected_neurons = list(set(weight_to_neuron.values()))
+
+            # If the user also wants weight indices that map to each neuron:
+            if return_weight_indices:
+                neuron_to_weights = {nid: neuron_to_all_weights[nid] for nid in affected_neurons}
+                return affected_neurons, neuron_to_weights
+
+            # Otherwise behave like before
+            return affected_neurons
+
+        return self.gradiend.get_top_k_weights(
+            part=part,
+            top_k=top_k,
+            scope=scope,
+            scope_direction=scope_direction,
+            return_sorted=return_sorted,
+            return_format=return_format,
+            map_to_neuron=map_to_neuron
+        )
 
 if __name__ == '__main__':
     gradiend = ModelWithGradiend.from_pretrained('results/models/bert-base-cased')

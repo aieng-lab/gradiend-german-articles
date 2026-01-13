@@ -84,7 +84,7 @@ def read_gender_data(file_name='data/gendered_words.json', force=False, as_dict=
                 gender_words[gender.upper()].append(word)
 
                 # we also consider the opposite gender word if available, e.g. 'son' -> 'daughter', because the mapping
-                # in the dataset is apparently not bijective
+                # in the datasets is apparently not bijective
                 if 'gender_map' in entry:
                     opposite_gender = 'm' if gender == 'f' else 'f'
                     opposite_gender_word = entry['gender_map'][opposite_gender][0]['word']
@@ -115,8 +115,45 @@ def generate_namextend():
                            filter_excluded_words=False,
                            max_entries=None)
 
-def read_article_ds(article, split=None):
-    return load_dataset_hf(path='csv', data_dir='gradiend/data/der_die_das/splits/' + article, split=sanitize_split(split)).to_pandas()
+article_mapping = {
+    'NM': 'masc_nom',
+    'AM': 'masc_acc',
+    'DM': 'masc_dat',
+    'GM': 'masc_gen',
 
-def read_de_neutral():
-    return load_dataset_hf(path="csv", data_files='gradiend/data/der_die_das/neutral/neutral_dwk.csv')['train'].to_pandas()
+    'NF': 'fem_nom',
+    'AF': 'fem_acc',
+    'DF': 'fem_dat',
+    'GF': 'fem_gen',
+
+    'NN': 'neut_nom',
+    'AN': 'neut_acc',
+    'DN': 'neut_dat',
+    'GN': 'neut_gen',
+}
+
+article_inv_mapping = {v: k for k, v in article_mapping.items()}
+
+def read_article_ds(article, split=None):
+    ds = load_dataset('aieng-lab/de-gender-case-articles', split=sanitize_split(split), config_name=article_mapping[article]).to_pandas()
+    return ds
+
+
+def read_de_neutral(max_size=None):
+    ds = load_dataset('aieng-lab/wortschatz-leipzig-de-grammar-neutral', split='train').to_pandas()
+    if max_size:
+        ds = ds.head(n=max_size)
+    ds['dataset_label'] = 'NEUTRAL'
+    ds['label'] = 'NEUTRAL'
+    return ds
+
+def read_article_ds_local(article, split=None):
+    df = load_dataset_hf(path='csv', data_dir='data/der_die_das/splits/' + article, split=sanitize_split(split)).to_pandas()
+    return df
+
+
+def read_de_neutral_local(max_size=None):
+    ds = load_dataset_hf(path="csv", data_files='data/der_die_das/neutral/neutral_dwk.csv')['train'].to_pandas()
+    if max_size:
+        ds = ds.head(n=max_size)
+    return ds

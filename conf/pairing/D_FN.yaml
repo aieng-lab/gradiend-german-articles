@@ -1,0 +1,27 @@
+plot_name: 'D_FN'
+palette:  {'F': 'purple','N': 'orange'}
+categories:
+  F: 
+    labels: [DF]
+    articles: [der]
+    codes: [0]
+    score_label: 1
+    encoding: -1
+  N: 
+    labels: [DN]
+    articles: [dem]
+    codes: [1]
+    score_label: 0
+    encoding: 1
+combinations: [DF, DN]
+articles: [der, dem]
+DF: 
+  mask: '[DER_ARTICLE]'
+  inverse: 'dem'
+  code: 0
+  encoding: -1
+DN: 
+  mask: '[DEM_ARTICLE]'
+  inverse: 'der'
+  code: 1
+  encoding: 1  

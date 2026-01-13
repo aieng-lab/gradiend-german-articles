@@ -1,0 +1,7 @@
+plot_name: 'GD'
+palette:  {'G': 'purple','D': 'orange'}
+categories:
+  G:
+    labels: [GM, GN] # excluding GF as it uses the same definite singular article 'der' as DF
+  D:
+    labels: [DM, DN] # excluding DF as it uses the same definite singular article 'der' as GF

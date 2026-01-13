@@ -1,0 +1,27 @@
+plot_name: 'A_FN'
+palette:  {'F': 'purple','N': 'orange'}
+categories:
+  F: 
+    labels: [AF]
+    articles: [die]
+    codes: [0]
+    score_label: 1
+    encoding: -1
+  N: 
+    labels: [AN]
+    articles: [das]
+    codes: [1]
+    score_label: 0
+    encoding: 1
+combinations: [AF, AN]
+articles: [die, das]
+AF: 
+  mask: '[DIE_ARTICLE]'
+  inverse: 'das'
+  code: 2
+  encoding: -1
+AN: 
+  mask: '[DAS_ARTICLE]'
+  inverse: 'die' 
+  code: 6
+  encoding: 1

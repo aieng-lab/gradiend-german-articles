@@ -145,7 +145,6 @@ class MultiEncoder(nn.Module):
 
     
 
-
 class CombinedEncoderDecoder(GradiendModel):
     def __init__(
         self,
@@ -383,29 +382,3 @@ class CombinedEncoderDecoder(GradiendModel):
     def forward(self, x, return_encoded=False):
         return super().forward(x, return_encoded)
 
-
-
-
-# if __name__ == "__main__":
-    # config = yaml.safe_load(open("config.yml"))["M_F_N_leipzig"]
-
-    # MF = "results/experiments/gradiend/MF/1e-05/bert-base-german-cased/0"
-    # MN = "results/experiments/gradiend/MN/1e-05/bert-base-german-cased/0"
-    # FN = "results/experiments/gradiend/FN/1e-5/bert-base-german-cased/0"
-
-    # MF_model = ModelWithGradiend.from_pretrained(MF)
-    # base_model = MF_model.base_model
-    # tokenizer = MF_model.tokenizer
-    # MN_model = ModelWithGradiend.from_pretrained(MN)
-    # FN_model = ModelWithGradiend.from_pretrained(FN)
-
-    # combined_enc_dec = CombinedEncoderDecoder(
-    #     grad_models=[MF_model, MN_model, FN_model],
-    #     num_encoders=3,
-    #     latent_dim=1,
-    #     merge=False,
-  
-    # )
-    # combined_model_with_grad = ModelWithGradiend(base_model, combined_enc_dec, tokenizer)
-
-    # train(combined_model_with_grad, config=config, multi_task=False)

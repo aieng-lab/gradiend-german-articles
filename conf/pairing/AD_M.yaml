@@ -1,0 +1,7 @@
+plot_name: 'AD_M'
+palette:  {'D': 'purple','A': 'orange'}
+categories:
+  A:
+    labels: [AM]
+  D:
+    labels: [DM]

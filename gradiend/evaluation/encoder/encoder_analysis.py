@@ -60,7 +60,7 @@ class EncoderAnalysis(ABC):
                 article
                 for key in self.gender_keys
                 for article in config["categories"][key]["articles"]
-            }
+            }.union(set(self.config.get('articles', [])))
         )
         self.det_combination = config["plot_name"]
 
@@ -74,8 +74,8 @@ class EncoderAnalysis(ABC):
     ):
         pass
 
-    def read_default_predictions(self, model):
-        file = get_default_prediction_file_name(model)
+    def read_default_predictions(self, model, combinations=None):
+        file = get_default_prediction_file_name(model, combinations)
 
         try:
             cache_default_predictions = pd.read_csv(file)
@@ -94,7 +94,7 @@ class EncoderAnalysis(ABC):
             cache_default_predictions_dict = cache_default_predictions.to_dict(
                 orient="index"
             )
-        except FileNotFoundError:
+        except Exception: # todo make the file depend on articles
             cache_default_predictions_dict = {}
 
         return cache_default_predictions_dict
@@ -154,13 +154,24 @@ class EncoderAnalysis(ABC):
 
         # Extract the logits and softmax to get probabilities
         logits = outputs.logits
-        mask_token_logits = logits[0, mask_token_index, :]
+        is_decoder_mlm_head = len(logits.shape) == 2
+
+        if is_decoder_mlm_head:
+            mask_token_logits = logits[0, :]
+        else:
+            mask_token_logits = logits[0, mask_token_index, :]
         probabilities = torch.softmax(mask_token_logits, dim=-1)
 
         token_ids = {}
 
-        for article in self.articles:
-            token_ids[article] = tokenizer.convert_tokens_to_ids(article)
+        if is_decoder_mlm_head:
+            target_tokens = tokenizer.convert_ids_to_tokens(model.target_token_ids)
+            for article in self.articles:
+                token_ids[article] = target_tokens.index(article)
+        else:
+            for article in self.articles:
+                token_ids[article] = tokenizer.convert_tokens_to_ids(article)
+
 
         # Get the probabilities for the determiners.
         shape = probabilities.shape
@@ -171,7 +182,7 @@ class EncoderAnalysis(ABC):
                 "most_likely_token": [],
             }
         else:
-            if is_generative:
+            if is_decoder_mlm_head:
                 probabilities = probabilities.unsqueeze(0)
 
             token_probabilities = {}

@@ -1,0 +1,27 @@
+plot_name: 'D_MF'
+palette:  {'M': 'blue','F': 'purple'}
+categories:
+  M: 
+    labels: ['DM']
+    articles: [dem]
+    codes: [0]
+    score_label: 1
+    encoding: -1
+  F: 
+    labels: ['DF']
+    articles: [der]
+    codes: [1]
+    score_label: 0
+    encoding: 1
+combinations: [DM, DF]
+articles: [dem, der]
+DM:
+  mask: '[DEM_ARTICLE]'
+  inverse: 'der'
+  code: 0
+  encoding: -1
+DF: 
+  mask: '[DER_ARTICLE]'
+  inverse: 'dem'
+  code: 1
+  encoding: 1 

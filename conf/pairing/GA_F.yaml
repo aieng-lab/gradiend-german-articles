@@ -1,0 +1,7 @@
+plot_name: 'GA_F'
+palette:  {'G': 'purple','A': 'orange'}
+categories:
+  G:
+    labels: [GF]
+  A:
+    labels: [AF]

@@ -1,0 +1,7 @@
+plot_name: 'NG_MF'
+palette:  {'N': 'purple','G': 'orange'}
+categories:
+  N:
+    labels: [NM]
+  G:
+    labels: [GF]

@@ -1,5 +1,6 @@
 import ast
 import io
+import json
 import os
 import pickle
 import re
@@ -11,6 +12,15 @@ from matplotlib import font_manager as fm, pyplot as plt
 default_accuracy_function = lambda x: x #np.power(x, 10)
 normalization = lambda x: x #np.power(x, 0.1)
 
+case_gender_mapping = {
+    'N': {'F': 'die', 'M': 'der', 'N': 'das', 'P': 'die'}, # Nominativ
+    'G': {'F': 'der', 'M': 'des', 'N': 'des', 'P': 'der'}, # Genitiv
+    'D': {'F': 'der', 'M': 'dem', 'N': 'dem', 'P': 'den'}, # Dativ
+    'A': {'F': 'die', 'M': 'den', 'N': 'das', 'P': 'die'}, # Akkusativ
+}
+
+RESULTS_DIR = 'results'
+IMAGE_DIR = 'img'
 
 def init_matplotlib(font_path="/root/times.ttf", use_tex=False):
     # Check if the font is already in the font manager
@@ -35,25 +45,15 @@ def init_matplotlib(font_path="/root/times.ttf", use_tex=False):
     if use_tex:
 
         preamble = r"""
+% --- Core packages (keep) ---
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{amsfonts}
 
+% --- Naming macros (text mode) ---
 \newcommand{\namexact}{\textsc{NAMExact}}
-\newcommand{\namexacttrain}{\ensuremath{\textsc{NAMExact}_\text{train}}}
-\newcommand{\namexacttest}{\ensuremath{\textsc{NAMExact}_\text{test}}}
 \newcommand{\namextend}{\textsc{NAMExtend}}
-
 \newcommand{\gradiend}{\textsc{Gradiend}}
-
-\newcommand{\bertbase}{$\text{BERT}_\text{base}$}
-\newcommand{\bertlarge}{$\text{BERT}_\text{large}$}
-\newcommand{\roberta}{RoBERTa}
-\newcommand{\distilbert}{DistilBERT}
-\newcommand{\gpttwo}{GPT-2}
-\newcommand{\llama}{LLaMA}
-\newcommand{\llamai}{\llama-Instruct}
-
 \newcommand{\dropout}{\textsc{Dropout}}
 \newcommand{\selfdebias}{\textsc{SelfDebias}}
 \newcommand{\sentencedebias}{\textsc{SentDebias}}
@@ -61,34 +61,123 @@ def init_matplotlib(font_path="/root/times.ttf", use_tex=False):
 \newcommand{\cda}{\textsc{CDA}}
 
 \newcommand{\genter}{\textsc{Genter}}
-\newcommand{\gentertrain}{$\genter_\text{train}$}
-\newcommand{\gentertest}{$\genter_\text{test}$}
-\newcommand{\genterval}{$\genter_\text{val}$}
-\newcommand{\genterzero}{$\genter^0$}
 \newcommand{\geneutral}{\textsc{GENeutral}}
 \newcommand{\gentypes}{\textsc{GENTypes}}
 
-\newcommand{\acc}{\text{Acc}}
-\newcommand{\cor}{\text{Cor}}
-\newcommand{\enc}{\text{Enc}}
-\newcommand{\dec}{\text{Dec}}
-\newcommand{\accenc}{\ensuremath{\acc_\enc}}
-\newcommand{\accdec}{\ensuremath{\acc_\dec}}
-\newcommand{\corenc}{\ensuremath{\cor_\enc}}
-\newcommand{\cormf}{\ensuremath{\cor_\text{\genter}}}
+% --- Safe math helpers (always use ensuremath; never embed $...$ inside macros) ---
+\newcommand{\namexacttrain}{\ensuremath{\textsc{NAMExact}_{\text{train}}}}
+\newcommand{\namexacttest}{\ensuremath{\textsc{NAMExact}_{\text{test}}}}
+
+\newcommand{\gentertrain}{\ensuremath{\genter_{\text{train}}}}
+\newcommand{\gentertest}{\ensuremath{\genter_{\text{test}}}}
+\newcommand{\genterval}{\ensuremath{\genter_{\text{val}}}}
+\newcommand{\genterzero}{\ensuremath{\genter^{0}}}
+
+% --- Model names (math-safe) ---
+\newcommand{\bertbase}{\ensuremath{\text{BERT}_{\text{base}}}}
+\newcommand{\bertlarge}{\ensuremath{\text{BERT}_{\text{large}}}}
+\newcommand{\roberta}{\textsc{RoBERTa}}
+\newcommand{\distilbert}{\textsc{DistilBERT}}
+\newcommand{\gpttwo}{\textsc{GermanGPT-2}}
+\newcommand{\llama}{\textsc{LLaMA}}
+% NOTE: the original \llamai used "\llama-Instruct" which is not a valid macro token.
+% Use text instead:
+\newcommand{\llamai}{\textsc{LLaMA-Instruct}}
+
+% --- Metrics (math-safe) ---
+\newcommand{\acc}{\ensuremath{\text{Acc}}}
+\newcommand{\cor}{\ensuremath{\text{Cor}}}
+\newcommand{\enc}{\ensuremath{\text{Enc}}}
+\newcommand{\dec}{\ensuremath{\text{Dec}}}
+
+\newcommand{\accenc}{\ensuremath{\acc_{\enc}}}
+\newcommand{\accdec}{\ensuremath{\acc_{\dec}}}
+\newcommand{\corenc}{\ensuremath{\cor_{\enc}}}
+
+\newcommand{\cormf}{\ensuremath{\cor_{\text{\genter}}}}
 \newcommand{\cormfval}{\ensuremath{\cor_{\text{\genter}_{\text{val}}}}}
 \newcommand{\cormftest}{\ensuremath{\cor_{\text{\genter}_{\text{test}}}}}
-\newcommand{\accmf}{\ensuremath{\acc_\text{\genter}}}
-\newcommand{\mamf}{\ensuremath{\overline{|h|}_\text{\genter}}}
-\newcommand{\masmf}{\ensuremath{\overline{|h|}_\text{\genterzero}}}
-\newcommand{\man}{\ensuremath{\overline{|h|}_\text{\geneutral}}}
 
-\newcommand{\fpi}{FPI}
-\newcommand{\mpi}{MPI}
-\newcommand{\bpi}{BPI}
-\newcommand{\gradiendfpi}{$\text{\gradiend}_\text{\fpi}$}
-\newcommand{\gradiendmpi}{$\text{\gradiend}_\text{\mpi}$}
-\newcommand{\gradiendbpi}{$\text{\gradiend}_\text{\bpi}$}
+\newcommand{\accmf}{\ensuremath{\acc_{\text{\genter}}}}
+\newcommand{\mamf}{\ensuremath{\overline{|h|}_{\text{\genter}}}}
+\newcommand{\masmf}{\ensuremath{\overline{|h|}_{\text{\genterzero}}}}
+\newcommand{\man}{\ensuremath{\overline{|h|}_{\text{\geneutral}}}}
+
+% --- FPI/MPI/BPI (math-safe) ---
+\newcommand{\fpi}{\text{FPI}}
+\newcommand{\mpi}{\text{MPI}}
+\newcommand{\bpi}{\text{BPI}}
+
+\newcommand{\gradiendfpi}{\ensuremath{\text{\gradiend}_{\text{\fpi}}}}
+\newcommand{\gradiendmpi}{\ensuremath{\text{\gradiend}_{\text{\mpi}}}}
+\newcommand{\gradiendbpi}{\ensuremath{\text{\gradiend}_{\text{\bpi}}}}
+
+% --- Dataset symbol (math-safe) ---
+\newcommand{\dataNEUT}{\ensuremath{D_{\textsc{Neutral}}}}
+
+% --- Model identifiers (text mode) ---
+\newcommand{\bert}{\textsc{GermanBERT}}
+\newcommand{\modernbert}{\textsc{ModernGBERT}}
+\newcommand{\gbert}{\textsc{GBERT}}
+\newcommand{\eurobert}{\textsc{EuroBERT}}
+
+% --- Cases / gender tags (math-safe) ---
+\newcommand{\nominative}{\ensuremath{\textsc{Nom}}}
+\newcommand{\accusative}{\ensuremath{\textsc{Acc}}}
+\newcommand{\dative}{\ensuremath{\textsc{Dat}}}
+\newcommand{\genitive}{\ensuremath{\textsc{Gen}}}
+
+\newcommand{\male}{\ensuremath{\textsc{Masc}}}
+\newcommand{\female}{\ensuremath{\textsc{Fem}}}
+\newcommand{\neutral}{\ensuremath{\textsc{Neut}}}
+
+% --- Gradiend symbol (math-safe) ---
+\newcommand{\gradiendsymb}{\ensuremath{G}}
+
+% --- ALL gradc* macros: NEVER use $...$ inside; always ensuremath ---
+\newcommand{\gradcNgMF}{\ensuremath{\gradiendsymb_{\nominative}^{\female,\male}}}
+\newcommand{\gradcNDgF}{\ensuremath{\gradiendsymb_{\nominative,\dative}^{\female}}}
+\newcommand{\gradcNGgF}{\ensuremath{\gradiendsymb_{\nominative,\genitive}^{\female}}}
+\newcommand{\gradcDAgF}{\ensuremath{\gradiendsymb_{\accusative,\dative}^{\female}}}
+\newcommand{\gradcADgF}{\ensuremath{\gradiendsymb_{\accusative,\dative}^{\female}}}
+\newcommand{\gradcGAgF}{\ensuremath{\gradiendsymb_{\accusative,\genitive}^{\female}}}
+\newcommand{\gradcNDgM}{\ensuremath{\gradiendsymb_{\nominative,\dative}^{\male}}}
+\newcommand{\gradcDgMF}{\ensuremath{\gradiendsymb_{\dative}^{\female,\male}}}
+\newcommand{\gradcDgFN}{\ensuremath{\gradiendsymb_{\dative}^{\female,\neutral}}}
+\newcommand{\gradcNGgM}{\ensuremath{\gradiendsymb_{\nominative,\genitive}^{\male}}}
+\newcommand{\gradcGgFM}{\ensuremath{\gradiendsymb_{\genitive}^{\female,\male}}}
+\newcommand{\gradcGgMF}{\ensuremath{\gradiendsymb_{\genitive}^{\female,\male}}}
+\newcommand{\gradcGgFN}{\ensuremath{\gradiendsymb_{\genitive}^{\female,\neutral}}}
+
+\newcommand{\gradcNgFN}{\ensuremath{\gradiendsymb_{\nominative}^{\female,\neutral}}}
+\newcommand{\gradcAgFN}{\ensuremath{\gradiendsymb_{\accusative}^{\female,\neutral}}}
+\newcommand{\gradcNDgN}{\ensuremath{\gradiendsymb_{\nominative,\dative}^{\neutral}}}
+\newcommand{\gradcADgN}{\ensuremath{\gradiendsymb_{\accusative,\dative}^{\neutral}}}
+\newcommand{\gradcNGgN}{\ensuremath{\gradiendsymb_{\nominative,\genitive}^{\neutral}}}
+\newcommand{\gradcAGgN}{\ensuremath{\gradiendsymb_{\accusative,\genitive}^{\neutral}}}
+\newcommand{\gradcGAgN}{\ensuremath{\gradiendsymb_{\accusative,\genitive}^{\neutral}}}
+
+\newcommand{\gradcNAgM}{\ensuremath{\gradiendsymb_{\nominative,\accusative}^{\male}}}
+\newcommand{\gradcAgMF}{\ensuremath{\gradiendsymb_{\accusative}^{\female,\male}}}
+\newcommand{\gradcNgMN}{\ensuremath{\gradiendsymb_{\nominative}^{\male,\neutral}}}
+\newcommand{\gradcAgMN}{\ensuremath{\gradiendsymb_{\accusative}^{\male,\neutral}}}
+\newcommand{\gradcADgM}{\ensuremath{\gradiendsymb_{\accusative,\dative}^{\male}}}
+
+% --- Data symbol macros (math-safe) ---
+\newcommand{\datasymbol}{\ensuremath{D}}
+\newcommand{\dataNM}{\ensuremath{\datasymbol_{\nominative}^{\male}}}
+\newcommand{\dataNF}{\ensuremath{\datasymbol_{\nominative}^{\female}}}
+\newcommand{\dataNN}{\ensuremath{\datasymbol_{\nominative}^{\neutral}}}
+\newcommand{\dataDM}{\ensuremath{\datasymbol_{\dative}^{\male}}}
+\newcommand{\dataDF}{\ensuremath{\datasymbol_{\dative}^{\female}}}
+\newcommand{\dataDN}{\ensuremath{\datasymbol_{\dative}^{\neutral}}}
+\newcommand{\dataAM}{\ensuremath{\datasymbol_{\accusative}^{\male}}}
+\newcommand{\dataAF}{\ensuremath{\datasymbol_{\accusative}^{\female}}}
+\newcommand{\dataAN}{\ensuremath{\datasymbol_{\accusative}^{\neutral}}}
+\newcommand{\dataGM}{\ensuremath{\datasymbol_{\genitive}^{\male}}}
+\newcommand{\dataGF}{\ensuremath{\datasymbol_{\genitive}^{\female}}}
+\newcommand{\dataGN}{\ensuremath{\datasymbol_{\genitive}^{\neutral}}}
+
         """
 
 
@@ -99,6 +188,38 @@ def init_matplotlib(font_path="/root/times.ttf", use_tex=False):
 
 def get_tensor_memory_size(tensor):
     return tensor.element_size() * tensor.numel()
+
+
+def convert_tuple_keys_recursively(obj):
+    if isinstance(obj, dict):
+        new_dict = {}
+        for k, v in obj.items():
+            # Convert tuple keys to JSON strings (of lists)
+            if isinstance(k, tuple):
+                k = json.dumps(k)
+            new_dict[k] = convert_tuple_keys_recursively(v)
+        return new_dict
+    elif isinstance(obj, list):
+        return [convert_tuple_keys_recursively(item) for item in obj]
+    else:
+        return obj
+
+def restore_tuple_keys_recursively(obj):
+    if isinstance(obj, dict):
+        new_dict = {}
+        for k, v in obj.items():
+            try:
+                k_loaded = json.loads(k)
+                if isinstance(k_loaded, list):
+                    k = tuple(k_loaded)
+            except (ValueError, json.JSONDecodeError):
+                pass
+            new_dict[k] = restore_tuple_keys_recursively(v)
+        return new_dict
+    elif isinstance(obj, list):
+        return [restore_tuple_keys_recursively(item) for item in obj]
+    else:
+        return obj
 
 
 def get_total_memory_usage(data):

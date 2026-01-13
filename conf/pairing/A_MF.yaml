@@ -1,0 +1,27 @@
+plot_name: 'MF'
+palette:  {'M': 'blue','F': 'purple'}
+categories:
+  M: 
+    labels: [AM]
+    articles: [den]
+    codes: [0]
+    score_label: 1
+    encoding: -1
+  F: 
+    labels: [AF]
+    articles: [die]
+    codes: [1]
+    score_label: 0
+    encoding: 1
+combinations: [AM, AF]
+articles: [den, die]
+AM: 
+  mask: '[DEN_ARTICLE]'
+  inverse: 'die' 
+  code: 0
+  encoding: -1
+AF: 
+  mask: '[DIE_ARTICLE]'
+  inverse: 'den'
+  code: 1
+  encoding: 1

@@ -1,0 +1,7 @@
+plot_name: 'NA'
+palette:  {'N': 'purple','A': 'orange'}
+categories:
+  N:
+    labels: [NM] # excluding NF and NN as they are using the same definite singular article 'die' and 'das' as AF and AN, respectively
+  A:
+    labels: [AM] # excluding AF and AN as they are using the same definite singular article 'die' and 'das' as NF and NN, respectively

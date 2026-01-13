@@ -1,5 +1,7 @@
 import ast
 import json
+import os
+
 from matplotlib import pyplot as plt
 import seaborn as sns
 import numpy as np
@@ -18,7 +20,7 @@ from scipy.stats import pearsonr
 from sklearn.cross_decomposition import CCA
 from scipy.stats import f_oneway
 
-
+from gradiend.training.decoder_only_mlm.model import DecoderModelWithMLMHead
 from gradiend.util import get_files_and_folders_with_prefix
 
 
@@ -35,6 +37,8 @@ class DeEncoderAnalysis(EncoderAnalysis):
         plot=False,
         multi_task=False,
         shared=False,
+        full=False,
+        neutral_data=None,
     ):
         from gradiend.combined_models.combined_gradiends import StackedGradiend
 
@@ -48,7 +52,8 @@ class DeEncoderAnalysis(EncoderAnalysis):
         ):
             combined_gradiend = model_with_gradiend.gradient
 
-        cache_default_predictions_dict = self.read_default_predictions(model)
+        combinations = dataset['dataset_label'].unique().tolist() if full else None
+        cache_default_predictions_dict = self.read_default_predictions(model, combinations=combinations)
 
         modified_cache = []
 
@@ -69,23 +74,28 @@ class DeEncoderAnalysis(EncoderAnalysis):
             source = model_with_gradiend.gradiend.kwargs["training"]["source"]
 
         filled_texts = []
+        correctly_filled_texts = []
         default_preds = self.config["default_predictions"]
 
         def process_entry(row, plot=False):
 
             key = row["dataset_label"]
             masked = row["masked"]
+            label = row["label"]
             encoded_values = []
             articles = []
             labels = []
+            mask_labels = []
             dataset_labels = []
             default_predictions = {k: [] for k in default_preds}
 
             inputs = []
             masked_texts = []
 
-            filled_text = masked.replace(self.config[key]["mask"], mask_token)
+            template_key = f"[{label}_ARTICLE]"
+            filled_text = masked.replace(template_key, mask_token)
             filled_texts.append(filled_text)
+            correctly_filled_texts.append(filled_text.replace(mask_token, label.lower()))
 
             label = row["label"].lower()
 
@@ -116,7 +126,7 @@ class DeEncoderAnalysis(EncoderAnalysis):
                     masked_label = self.config[key]["inverse"]
                 else:
                     raise ValueError(f"Unknown source: {source}")
-
+                mask_labels.append(masked_label)
                 inputs.append((filled_text, masked_label))
 
                 # if combined_gradiend:
@@ -173,7 +183,13 @@ class DeEncoderAnalysis(EncoderAnalysis):
                     default_prediction["label"] = label
 
                     for key, value in default_prediction.items():
-                        default_predictions[key].append(value)
+                        if key in default_predictions:
+                            default_predictions[key].append(value)
+
+                    # checking for missing keys
+                    for key in [k for k in default_predictions if k not in {'label', 'most_likely_token'}]:
+                        if key not in default_prediction:
+                            raise ValueError(f"Key {key} not in default prediction for text: {filled_text}")
 
                     masked_texts.append(masked)
 
@@ -187,6 +203,7 @@ class DeEncoderAnalysis(EncoderAnalysis):
                     "encoded": encoded_values,
                     "labels": unique_labels,
                     "type": f"{self.det_combination} masked",
+                    "mask_labels": mask_labels,
                     **default_predictions,
                 }
             )
@@ -228,25 +245,38 @@ class DeEncoderAnalysis(EncoderAnalysis):
             )
         )
 
-        torch.manual_seed(42)
-        # TODO this right now is not that important, i dont have the right dataset for this.
-        for text in tqdm(
-            filled_texts, desc=f"{self.det_combination} data without determiners masked"
-        ):
-            encoded, masked_text, label = model_with_gradiend.mask_and_encode(
-                text,
-                ignore_tokens=ingore_tokens,
-                return_masked_text=True,
-                shared=shared,
-            )
-            texts.append(text)
-            encoded_values.append(encoded.tolist())
-            labels.append(label)
 
-            default_prediction = get_de_default_predictions(masked_text)
-            default_prediction["label"] = label
-            for key, value in default_prediction.items():
-                default_predictions[key].append(value)
+        torch.manual_seed(42)
+        if neutral_data is None:
+            neutral_data = correctly_filled_texts
+        # TODO this right now is not that important, i dont have the right datasets for this.
+
+        try:
+            if isinstance(model, DecoderModelWithMLMHead):
+                # run using CLM gradients of the underlying decoder-only model
+                model_with_gradiend.base_model = model_with_gradiend.base_model.decoder
+
+            for text in tqdm(
+                neutral_data, desc=f"{self.det_combination} data without determiners masked"
+            ):
+                encoded, masked_text, label = model_with_gradiend.mask_and_encode(
+                    text,
+                    ignore_tokens=ingore_tokens,
+                    return_masked_text=True,
+                    shared=shared,
+                )
+                texts.append(text)
+                encoded_values.append(encoded.tolist())
+                labels.append(label)
+
+                default_prediction = get_de_default_predictions(masked_text)
+                default_prediction["label"] = label
+                for key, value in default_prediction.items():
+                    if key in default_predictions:
+                        default_predictions[key].append(value)
+        except Exception as e:
+            print(f"Error processing neutral data: {e}")
+            raise e
 
         result = pd.DataFrame(
             {
@@ -346,7 +376,7 @@ class DeEncoderAnalysis(EncoderAnalysis):
         return df_all, json_file
 
     def get_model_metrics(
-        self, *encoded_values, prefix=None, multi_grad=False, suffix=".csv", **kwargs
+        self, *encoded_values, prefix=None, multi_grad=False, suffix=".csv", split=None, **kwargs
     ):
         # TODO also use helper function for this
         if prefix:
@@ -363,22 +393,46 @@ class DeEncoderAnalysis(EncoderAnalysis):
             return metrics
 
         raw_encoded_values = encoded_values[0]
-        encoded_values = get_file_name(raw_encoded_values, file_format="csv", **kwargs)
+
+        scores = None
+        encoded_values = get_file_name(raw_encoded_values, file_format="csv", split=split, inverse=None, **kwargs)
         json_file = encoded_values.replace(".csv", ".json")
 
-        df_all = pd.read_csv(
-            encoded_values,
-            converters={
-                "encoded": lambda x: ast.literal_eval(x)[0] if isinstance(x, str) else x
-            },
-        )
+        scores = None
+        if os.path.exists(json_file):
+            print("Loading existing metrics from", json_file)
+            with open(json_file, "r") as f:
+                scores = json.load(f)
 
-        scores = self._get_basic_model_metrics(df_all=df_all)
+            if 'pearson' not in scores:
+                scores = None
+            if scores['pearson'] is None or np.isnan(scores['pearson']):
+                scores = None
+                print("Scores contain NaN, recomputing", encoded_values)
 
-        print(scores)
+        if scores is None:
+            for use_inverse in [None, True, False]:
+                _kwargs = {} if use_inverse is None else {'variant': 'all'}
+                encoded_values = get_file_name(raw_encoded_values, file_format="csv", split=split, inverse=use_inverse, **kwargs, **_kwargs)
 
-        with open(json_file, "w") as f:
-            json.dump(scores, f, indent=4)
+                df_all = pd.read_csv(
+                    encoded_values,
+                    converters={
+                        "encoded": lambda x: ast.literal_eval(x)[0] if isinstance(x, str) else x
+                    },
+                )
+
+                if use_inverse is None:
+                    scores = self._get_basic_model_metrics(df_all=df_all)
+                elif use_inverse is True:
+                    scores['all_inverse'] = self._get_basic_model_metrics(df_all=df_all)
+                else:
+                    scores['all_id'] = self._get_basic_model_metrics(df_all=df_all)
+
+            print(scores)
+
+            with open(json_file, "w") as f:
+                json.dump(scores, f, indent=4)
 
         return scores
 
@@ -420,80 +474,6 @@ class DeEncoderAnalysis(EncoderAnalysis):
             ]
         )
 
-        acc_optimized_border_M_pos = np.mean(
-            [
-                max(
-                    (
-                        (text_df["encoded"] < threshold)
-                        == text_df["state_value"].astype(bool)
-                    ).sum()
-                    / len(text_df)
-                    for threshold in np.arange(-1.0, 1.0, 0.1)
-                )
-                for text, text_df in df.groupby("text")
-            ]
-        )
-        acc_optimized_border_M_neg = np.mean(
-            [
-                max(
-                    (
-                        (text_df["encoded"] > threshold)
-                        == text_df["state_value"].astype(bool)
-                    ).sum()
-                    / len(text_df)
-                    for threshold in np.arange(-1.0, 1.0, 0.1)
-                )
-                for text, text_df in df.groupby("text")
-            ]
-        )
-
-        acc_M_positive_global = np.mean(
-            [
-                (
-                    (text_df[f"global_z_score_{self.det_combination}"] >= 0)
-                    == text_df["state_value"].astype(bool)
-                ).sum()
-                / len(text_df)
-                for text, text_df in df.groupby("text")
-            ]
-        )
-        acc_M_negative_global = np.mean(
-            [
-                (
-                    (text_df[f"global_z_score_{self.det_combination}"] < 0)
-                    == text_df["state_value"].astype(bool)
-                ).sum()
-                / len(text_df)
-                for text, text_df in df.groupby("text")
-            ]
-        )
-
-        acc_optimized_border_M_pos_global = np.mean(
-            [
-                max(
-                    (
-                        (text_df[f"global_z_score_{self.det_combination}"] < threshold)
-                        == text_df["state_value"].astype(bool)
-                    ).sum()
-                    / len(text_df)
-                    for threshold in np.arange(-1.0, 1.0, 0.1)
-                )
-                for text, text_df in df.groupby("text")
-            ]
-        )
-        acc_optimized_border_M_neg_global = np.mean(
-            [
-                max(
-                    (
-                        (text_df[f"global_z_score_{self.det_combination}"] > threshold)
-                        == text_df["state_value"].astype(bool)
-                    ).sum()
-                    / len(text_df)
-                    for threshold in np.arange(-1.0, 1.0, 0.1)
-                )
-                for text, text_df in df.groupby("text")
-            ]
-        )
 
         # rename the keys such that blanks are replaced by '_'
         df_all = df_all.rename(columns=lambda x: x.replace(" ", "_"))
@@ -545,26 +525,25 @@ class DeEncoderAnalysis(EncoderAnalysis):
         pearson = get_pearson_correlation(df)
         spearman = get_spearman_correlation(df)
 
+
+        mean_by_class = df.groupby("dataset_labels")["encoded"].mean()
+        mean_by_label = df.groupby("label")["encoded"].mean()
+
         scores = {
             "pearson_total": pearson_total["correlation"],
             "pearson_total_p_value": pearson_total["p_value"],
             "spearman_total": spearman_total["correlation"],
             "spearman_total_p_value": spearman_total["p_value"],
             "acc_total": acc_total,
-            "pearson": pearson["correlation"],
+            "pearson": abs(pearson["correlation"]),
             "pearson_p_value": pearson["p_value"],
             "spearmann": spearman,
             "spearman_p_value": spearman["p_value"],
             "acc": max(acc_M_negative, acc_M_positive),
-            "acc_zscore": max(acc_M_negative_global, acc_M_positive_global),
-            "acc_optimized": max(
-                acc_optimized_border_M_neg, acc_optimized_border_M_pos
-            ),
-            "acc_optimized_zscore": max(
-                acc_optimized_border_M_neg_global, acc_optimized_border_M_pos_global
-            ),
             "encoded_abs_means": encoded_abs_means,
             "encoded_means": encoded_means,
+            "mean_by_class": mean_by_class.to_dict(),
+            "mean_by_label": mean_by_label.to_dict(),
             **self.get_std_stats(df),
         }
 
