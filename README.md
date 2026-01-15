@@ -1,6 +1,7 @@
 # Understanding or Memorizing? A Case Study of German Definite Articles in Language Models
 > Jonathan Drechsel, Erisa Bytyqi, Steffen Herbold
 
+[![arXiV](https://img.shields.io/badge/arXiv-2601.09313-blue.svg)](https://arxiv.org/abs/2601.09313)
 [![arXiv](https://img.shields.io/badge/arXiv-2502.01406-blue.svg)](https://arxiv.org/abs/2502.01406)
 
 
@@ -8,7 +9,7 @@ This is a fork of the official source code for the training and evaluation of [G
 
 ## Quick Links
 
-- [Understanding or Memorizing Paper](todo)
+- [Understanding or Memorizing Paper](https://arxiv.org/abs/2601.09313)
 - [GRADIEND Paper](https://arxiv.org/abs/2502.01406)
 - German GRADIEND Training and Evaluation Datasets (Hugging Face):
   - [aieng-lab/de-gender-case-articles](https://huggingface.co/datasets/aieng-lab/de-gender-case-articles)
@@ -131,3 +132,34 @@ To keep track of the changes made to the original GRADIEND repository, here is a
   - `gradiend.evaluation.xai.io.GradiendGenderCaseConfiguration` is a utility class that defines easy definition of a specific configuration, including various functions, e.g., to derive datasets, articles, ...
 - Probability analysis (`gradiend.evaluation.decoder.de_decoder_probability_analysis`, ...)
 - Top-k analysis (`gradiend.evaluation.xai.venn_plot`, ...)
+
+
+## Citation
+
+Please cite the following paper if you use our code or datasets in your research:
+
+```bib
+@misc{drechsel2026understandingmemorizingcasestudy,
+      title={Understanding or Memorizing? A Case Study of German Definite Articles in Language Models}, 
+      author={Jonathan Drechsel and Erisa Bytyqi and Steffen Herbold},
+      year={2026},
+      eprint={2601.09313},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2601.09313}, 
+}
+```
+
+The GRADIEND method itself is described in:
+
+```bib
+@misc{drechsel2025gradiendfeaturelearning,
+      title={{GRADIEND}: Feature Learning within Neural Networks Exemplified through Biases}, 
+      author={Jonathan Drechsel and Steffen Herbold},
+      year={2025},
+      eprint={2502.01406},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2502.01406}, 
+}
+```
