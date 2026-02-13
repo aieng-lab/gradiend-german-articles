@@ -65,18 +65,6 @@ class CombinedLoss(nn.Module):
     def __str__(self):
         return f'CombinedLoss(alpha={self.alpha})'
 
-class PolarFeatureLoss(nn.Module):
-    def __init__(self, alpha=0.001):
-        super(PolarFeatureLoss, self).__init__()
-        self.mse = nn.MSELoss()
-        self.alpha = alpha
-
-    def forward(self, output, target, encoded_value):
-        mse_loss = self.mse(output, target)
-        reg_term = 1.0 - torch.abs(encoded_value)
-        loss = mse_loss + self.alpha * reg_term * mse_loss
-        print(f'MSE Loss: {mse_loss.item()}, Regularization Term: {reg_term.item()}, Encoded Value: {encoded_value.item()}')
-        return loss
 
 
 """
@@ -477,28 +465,25 @@ def train(model_with_gradiend,
                 gc.collect()
 
 
-                if isinstance(criterion_ae, PolarFeatureLoss):
-                    loss_ae = criterion_ae(outputs_ae, target_tensor, encoded_value)
+                if multi_task:
+                    if source == 'gradient':
+                        task_losses = []
+                        for grad_target in target_tensors:
+                            task_loss_ae = criterion_ae(outputs_ae, grad_target)
+                            task_losses.append(task_loss_ae)
+
+                        loss_ae = torch.stack(task_losses).mean()
+                        # optimizer_ae.pc_backward(task_losses)
+                    elif source == 'inv_gradient':
+                        task_losses = []
+                        for grad_output_ae, grad_target in zip(all_outputs, target_tensors):
+                            task_loss_ae = criterion_ae(grad_output_ae, grad_target)
+                            task_losses.append(task_loss_ae)
+
+                        loss_ae = torch.stack(task_losses).mean()
+                        # optimizer_ae.pc_backward(task_losses)
                 else:
-                    if multi_task:
-                        if source == 'gradient': 
-                            task_losses = []
-                            for grad_target in target_tensors: 
-                                task_loss_ae = criterion_ae(outputs_ae, grad_target)
-                                task_losses.append(task_loss_ae)
-
-                            loss_ae = torch.stack(task_losses).mean()
-                            # optimizer_ae.pc_backward(task_losses)
-                        elif source == 'inv_gradient': 
-                            task_losses = []
-                            for grad_output_ae, grad_target in zip(all_outputs, target_tensors):
-                                task_loss_ae = criterion_ae(grad_output_ae, grad_target)
-                                task_losses.append(task_loss_ae)
-
-                            loss_ae = torch.stack(task_losses).mean() 
-                            # optimizer_ae.pc_backward(task_losses)
-                    else:     
-                        loss_ae = criterion_ae(outputs_ae, target_tensor)
+                    loss_ae = criterion_ae(outputs_ae, target_tensor)
                 del target_tensor
                 
 

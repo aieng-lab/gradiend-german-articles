@@ -445,7 +445,11 @@ semi_interesting_classes = {
     ('das', 'des'): [
         (Case.NOMINATIVE, Case.GENITIVE, Gender.NEUTRAL),
         (Case.ACCUSATIVE, Case.GENITIVE, Gender.NEUTRAL),
-    ]
+    ],
+    ('dem', 'des'): [
+        (Case.DATIVE, Case.GENITIVE, Gender.MALE),
+        (Case.DATIVE, Case.GENITIVE, Gender.NEUTRAL),
+    ],
 }
 
 all_interesting_classes = interesting_config_classes | semi_interesting_classes

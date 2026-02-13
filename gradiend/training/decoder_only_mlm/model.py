@@ -234,6 +234,8 @@ class DecoderModelWithMLMHead(PreTrainedModel):
                     print('WARNING: No valid labels found for the provided target_token_ids. Skipping loss computation.')
                     loss = logits.sum() * 0.0
                     logits = logits[:0]
+        else:
+            loss = logits.sum() * 0.0
 
         return DecoderWithMLMHeadOutput(logits=logits, loss=loss)
 

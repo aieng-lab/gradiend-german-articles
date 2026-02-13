@@ -8,7 +8,7 @@ import torch
 
 from gradiend.evaluation.analyze_encoder import analyze_models
 from gradiend.evaluation.select_models import select
-from gradiend.training import train_all_layers_gradiend, train_multiple_layers_gradiend, PolarFeatureLoss
+from gradiend.training import train_all_layers_gradiend, train_multiple_layers_gradiend
 
 
 def train(base_model,config, model_config, dim, n=3, metric='pearson', multi_task=False, force=True, version=None, clear_cache=False):

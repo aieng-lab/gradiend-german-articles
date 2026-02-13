@@ -224,7 +224,7 @@ class MLMDataset(Dataset):
         label = entry["label"]
         target = label.lower()
 
-        expected_key = f"[{label}_ARTICLE]"
+        expected_key = f"[{label.upper()}_ARTICLE]"
         if expected_key not in masked:
             raise ValueError(
                 f"Expected key '{expected_key}' not found in masked text: {masked}"

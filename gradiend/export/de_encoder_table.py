@@ -30,6 +30,10 @@ configs = [
     # das ↔ des
     (Case.NOMINATIVE, Case.GENITIVE, Gender.NEUTRAL),
     (Case.ACCUSATIVE, Case.GENITIVE, Gender.NEUTRAL),
+
+    # dem ↔ des
+    (Case.DATIVE, Case.GENITIVE, Gender.MALE),
+    (Case.DATIVE, Case.GENITIVE, Gender.NEUTRAL),
 ]
 
 

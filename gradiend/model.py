@@ -663,7 +663,7 @@ class GradiendModel(nn.Module):
         # Load model state dictionary
         try:
             state_dict = torch.load(model_path, map_location=device_decoder, weights_only=True)
-        except Exception as e:
+        except FileNotFoundError as e:
             raise FileNotFoundError(f"Could not load model from {model_path}. Please ensure the file exists and is accessible.", e)
 
         # Check if the model is a legacy checkpoint
@@ -1191,8 +1191,6 @@ class GradiendModel(nn.Module):
 
 def is_generative(model):
     return hasattr(model, 'lm_head') or 'llama' in model.__class__.__name__.lower()
-
-
 
 
 class ModelWithGradiend(nn.Module):

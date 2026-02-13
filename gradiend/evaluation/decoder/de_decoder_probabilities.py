@@ -353,38 +353,14 @@ if __name__ == "__main__":
         ],
     }
 
-    base_model_id = 'bert-base-german-cased'
-    base_model_id = 'EuroBERT-210m'
-    base_model_id = 'german-gpt2'
-
     models = [
-        #'EuroBERT-210m',
-        #'bert-base-german-cased',
-        #'german-gpt2',
-        #'Llama-3.2-3B',
-        #'gbert-large',
+        'EuroBERT-210m',
+        'bert-base-german-cased',
+        'german-gpt2',
+        'Llama-3.2-3B',
+        'gbert-large',
         'ModernGBERT_1B',
     ]
-
-    statistical_analysis_config_classes = {
-        #('der', 'die'): [
-        #    (Case.NOMINATIVE, Gender.MALE, Gender.FEMALE),
-            # (Case.NOMINATIVE, Case.DATIVE, Gender.FEMALE),
-            # (Case.NOMINATIVE, Case.GENITIVE, Gender.FEMALE),
-        #    (Case.DATIVE, Case.ACCUSATIVE, Gender.FEMALE),
-        #    (Case.GENITIVE, Case.ACCUSATIVE, Gender.FEMALE),
-        #],
-        ('der', 'dem'): [
-        #    (Case.NOMINATIVE, Case.DATIVE, Gender.MALE),
-            # (Case.DATIVE, Gender.MALE, Gender.FEMALE),
-            (Case.DATIVE, Gender.NEUTRAL, Gender.FEMALE),
-        ],
-        ('der', 'des'): [
-            (Case.NOMINATIVE, Case.GENITIVE, Gender.MALE),
-            # (Case.GENITIVE, Gender.FEMALE, Gender.MALE),
-            (Case.GENITIVE, Gender.NEUTRAL, Gender.FEMALE),
-        ]
-    }
 
     transitions = {
         ('der', 'die'): 'die',

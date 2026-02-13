@@ -92,7 +92,7 @@ class DeEncoderAnalysis(EncoderAnalysis):
             inputs = []
             masked_texts = []
 
-            template_key = f"[{label}_ARTICLE]"
+            template_key = f"[{label.upper()}_ARTICLE]"
             filled_text = masked.replace(template_key, mask_token)
             filled_texts.append(filled_text)
             correctly_filled_texts.append(filled_text.replace(mask_token, label.lower()))

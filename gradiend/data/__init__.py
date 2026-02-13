@@ -10,8 +10,9 @@ from gradiend.data.names import *
 from gradiend.data.util import *
 
 
-def load_dataset(name, split=None, trust_remote_code=False):
-    dataset = load_dataset_hf(name, split=sanitize_split(split), trust_remote_code=trust_remote_code)
+def load_dataset(name, subset=None, *, split=None, trust_remote_code=False):
+    args = (subset,) if subset else tuple()
+    dataset = load_dataset_hf(name, *args, split=sanitize_split(split), trust_remote_code=trust_remote_code)
 
     if split is None:
         return pd.concat([ds.to_pandas() for ds in dataset.values()])
@@ -135,12 +136,20 @@ article_mapping = {
 article_inv_mapping = {v: k for k, v in article_mapping.items()}
 
 def read_article_ds(article, split=None):
-    ds = load_dataset('aieng-lab/de-gender-case-articles', split=sanitize_split(split), config_name=article_mapping[article]).to_pandas()
+    ds = load_dataset('aieng-lab/de-gender-case-articles', article_mapping[article], split=sanitize_split(split))
+
+    ds['label'] = ds['label'].str.lower()
+    article_token = "[" + ds['label'].str.upper() + "_ARTICLE]"
+    ds['masked'] = [
+        s.replace("[MASK]", tok)
+        for s, tok in zip(ds['masked'], article_token)
+    ]
+
     return ds
 
 
 def read_de_neutral(max_size=None):
-    ds = load_dataset('aieng-lab/wortschatz-leipzig-de-grammar-neutral', split='train').to_pandas()
+    ds = load_dataset('aieng-lab/wortschatz-leipzig-de-grammar-neutral', split='train')
     if max_size:
         ds = ds.head(n=max_size)
     ds['dataset_label'] = 'NEUTRAL'
