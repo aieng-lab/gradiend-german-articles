@@ -14,7 +14,8 @@ This is a fork of the official source code for the training and evaluation of [G
 - German GRADIEND Training and Evaluation Datasets (Hugging Face):
   - [aieng-lab/de-gender-case-articles](https://huggingface.co/datasets/aieng-lab/de-gender-case-articles)
   - [aieng-lab/wortschatz-leipzig-de-grammar-neutral](https://huggingface.co/datasets/aieng-lab/wortschatz-leipzig-de-grammar-neutral)
-- [SuperGLEBer Repository Fork](https://github.com/aieng-lab/SuperGLEBer) including our adaptions like bootstrap evaluation 
+- [SuperGLEBer Repository Fork](https://github.com/aieng-lab/SuperGLEBer) including our adaptions like bootstrap evaluation
+- [GRADIEND Python Package](https://github.com/aieng-lab/gradiend)
 
 ## Install
 
