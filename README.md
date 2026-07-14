@@ -9,7 +9,7 @@ This is a fork of the official source code for the training and evaluation of [G
 
 ## Quick Links
 
-- [Understanding or Memorizing Paper](https://arxiv.org/abs/2601.09313)
+- [Understanding or Memorizing Paper](https://aclanthology.org/2026.acl-long.436/)
 - [GRADIEND Paper](https://arxiv.org/abs/2502.01406)
 - German GRADIEND Training and Evaluation Datasets (Hugging Face):
   - [aieng-lab/de-gender-case-articles](https://huggingface.co/datasets/aieng-lab/de-gender-case-articles)
