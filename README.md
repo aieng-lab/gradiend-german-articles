@@ -140,27 +140,37 @@ To keep track of the changes made to the original GRADIEND repository, here is a
 Please cite the following paper if you use our code or datasets in your research:
 
 ```bib
-@misc{drechsel2026understandingmemorizingcasestudy,
-      title={Understanding or Memorizing? A Case Study of German Definite Articles in Language Models}, 
-      author={Jonathan Drechsel and Erisa Bytyqi and Steffen Herbold},
-      year={2026},
-      eprint={2601.09313},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2601.09313}, 
+@inproceedings{drechsel-etal-2026-understanding,
+    title = "Understanding or Memorizing? A Case Study of {G}erman Definite Articles in Language Models",
+    author = "Drechsel, Jonathan  and
+      Bytyqi, Erisa  and
+      Herbold, Steffen",
+    editor = "Liakata, Maria  and
+      Moreira, Viviane P.  and
+      Zhang, Jiajun  and
+      Jurgens, David",
+    booktitle = "Proceedings of the 64th Annual Meeting of the {A}ssociation for {C}omputational {L}inguistics (Volume 1: Long Papers)",
+    month = jul,
+    year = "2026",
+    address = "San Diego, California, United States",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2026.acl-long.436/",
+    doi = "10.18653/v1/2026.acl-long.436",
+    pages = "9626--9652",
+    ISBN = "979-8-89176-390-6",
+    abstract = "Language models perform well on grammatical agreement, but it is unclear whether this reflects rule-based generalization or memorization. We study this question for German definite singular articles, whose forms depend on gender and case. Using GRADIEND, a gradient-based interpretability method, we learn parameter update directions for gender-case specific article transitions. We find that updates learned for a specific gender-case article transition frequently affect unrelated gender-case settings, with substantial overlap among the most affected neurons across settings. These results argue against a strictly rule-based encoding of German definite articles, indicating that models at least partly rely on memorized associations rather than abstract grammatical rules."
 }
 ```
 
 The GRADIEND method itself is described in:
 
 ```bib
-@misc{drechsel2025gradiendfeaturelearning,
-      title={{GRADIEND}: Feature Learning within Neural Networks Exemplified through Biases}, 
-      author={Jonathan Drechsel and Steffen Herbold},
-      year={2025},
-      eprint={2502.01406},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2502.01406}, 
+@inproceedings{
+drechsel2026gradiend,
+title={{GRADIEND}: Feature Learning within Neural Networks Exemplified through Biases},
+author={Jonathan Drechsel and Steffen Herbold},
+booktitle={The Fourteenth International Conference on Learning Representations},
+year={2026},
+url={https://openreview.net/forum?id=1vBNAnAgCD}
 }
 ```
